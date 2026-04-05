@@ -1,0 +1,5 @@
+/home/swnh/gpcc/build/CMakeFiles/edit_cache.dir
+/home/swnh/gpcc/build/CMakeFiles/rebuild_cache.dir
+/home/swnh/gpcc/build/sandbox/CMakeFiles/predgeom.dir
+/home/swnh/gpcc/build/sandbox/CMakeFiles/edit_cache.dir
+/home/swnh/gpcc/build/sandbox/CMakeFiles/rebuild_cache.dir
