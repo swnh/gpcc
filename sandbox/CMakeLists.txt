@@ -57,6 +57,7 @@ set(ORIGINAL_SOURCES
 # Custom
 set(CUSTOM_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp
+    #${CMAKE_CURRENT_SOURCE_DIR}/predGeom.cpp    
     ${CMAKE_CURRENT_SOURCE_DIR}/geometry_predictive_encoder.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/ply.cpp
 )
