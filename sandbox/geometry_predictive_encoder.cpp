@@ -1456,177 +1456,6 @@ originFromLaserAngle(const PCCPointSet3& cloud)
 
   return origin;
 }
-// ============================================================================
-void
-PredGeomEncoder::encodePredGeom(const Vec3<int32_t>& residual, const int laserIdx)
-{
-  // Select ring group for context memory
-  //   numGroups=1  → all rings → group 0
-  //   numGroups=32 → each ring → own group
-  const int ringsPerGroup = kNumRings / _numRingGroups;
-  const int g = (laserIdx / ringsPerGroup) % _numRingGroups;
-
-  int k = 0;
-  for (int ctxIdx = 0; k < 3; k++) {
-    const auto res = residual[k];
-    _aec->encode(res != 0, _ctxResGt0_g[g][k]);
-    if (!res)
-      continue;
-
-    int32_t value = abs(res) - 1;
-    int32_t numBits = 1 + ilog2(uint32_t(value));
-
-    AdaptiveBitModel* ctxs = &_ctxNumBits_g[g][ctxIdx][k][0] - 1;
-    for (int ctxIdx = 1, n = _pgeom_resid_abs_log2_bits[k] - 1; n >= 0; n--) {
-      auto bin = (numBits >> n) & 1;
-      _aec->encode(bin, ctxs[ctxIdx]);
-      ctxIdx = (ctxIdx << 1) | bin;
-    }
-
-    ctxIdx = std::min(4, (numBits + 1) >> 1);
-
-    --numBits;
-    for (int32_t i = 0; i < numBits; ++i)
-      _aec->encode((value >> i) & 1);
-
-    _aec->encode(res < 0, _ctxSign_g[g][k]);
-  }
-}
-
-// ============================================================================
-// Simplified single-function encoder: flat loop, ring-based prediction,
-// no tree construction, no mode decision, no inter-frame prediction.
-void
-encodePredictiveGeometry(
-  const PredGeomEncOpts& opt,
-  const GeometryParameterSet& gps,
-  GeometryBrickHeader& gbh,
-  PCCPointSet3& cloud,
-  PredGeomContexts& ctxtMem,
-  EntropyEncoder* arithmeticEncoder,
-  const int* ring,
-  int numGroups)
-{
-  auto numPoints = cloud.getPointCount();
-  //auto numLasers = gps.numLasers();
-
-  // storage for reordering the output point cloud
-  PCCPointSet3 outCloud;
-  outCloud.addRemoveAttributes(cloud.hasColors(), cloud.hasReflectances());
-  outCloud.resize(numPoints);
-
-  std::vector<int32_t> codedOrder(numPoints, -1);
-
-  // Fixed residual bit-depth (simple configuration)
-  for (int k = 0; k < 3; k++) {
-    gbh.pgeom_resid_abs_log2_bits[k] = 5;
-  }
-
-  PredGeomEncoder enc(gps, gbh, opt, ctxtMem, arithmeticEncoder, numGroups);
-
-  // Per-laser history for prediction (indexed by ring/laser ID)
-  std::array<point_t, kNumRings> hist = {};
-  std::array<bool, kNumRings> histValid = {};
-  histValid.fill(false);
-
-  // Reconstruction history (mirrors decoder side)
-  std::array<point_t, kNumRings> reconHist = {};
-  std::array<bool, kNumRings> reconHistValid = {};
-  reconHistValid.fill(false);
-
-  // Storage for reconstructed points
-  std::vector<point_t> reconPoints(numPoints);
-
-  enc.encodeEndOfTreesFlag(false);
-
-  for (int p = 0; p < numPoints; p++) {
-    const auto& curr = cloud[p];
-    int laserIdx = ring[p];
-
-    // === Encoder side: compute residual ===
-    point_t pred = 0;
-    if (histValid[laserIdx]) {
-      pred = hist[laserIdx];
-    }
-    point_t residual = curr - pred;
-    
-    // Update encoder history with original point
-    hist[laserIdx] = curr;
-    histValid[laserIdx] = true;
-
-    // Encode
-    enc.encodePredGeom(residual, laserIdx);
-
-    // === Decoder-side reconstruction: pred + residual ===
-    point_t reconPred = 0;
-    if (reconHistValid[laserIdx]) {
-      reconPred = reconHist[laserIdx];
-    }
-    point_t reconPoint = reconPred + residual;
-
-    // Update reconstruction history
-    reconHist[laserIdx] = reconPoint;
-    reconHistValid[laserIdx] = true;
-
-    reconPoints[p] = reconPoint;
-    codedOrder[p] = p;
-  }
-
-  enc.encodeEndOfTreesFlag(true);
-
-  // save the context state for re-use by a future slice if required
-  ctxtMem = enc.getCtx();
-
-  // ---- Debug: write reconstructed point cloud as PLY ----
-  {
-    std::ofstream ply("recon_debug.ply");
-    ply << "ply\n";
-    ply << "format ascii 1.0\n";
-    ply << "element vertex " << numPoints << "\n";
-    ply << "property int x\n";
-    ply << "property int y\n";
-    ply << "property int z\n";
-    ply << "property int ring\n";
-    ply << "end_header\n";
-    for (int i = 0; i < numPoints; i++) {
-      ply << reconPoints[i][0] << " "
-          << reconPoints[i][1] << " "
-          << reconPoints[i][2] << " "
-          << ring[i] << "\n";
-    }
-    ply.close();
-
-    // Also verify reconstruction matches original
-    int mismatchCount = 0;
-    for (int i = 0; i < numPoints; i++) {
-      if (reconPoints[i] != cloud[i]) {
-        if (mismatchCount < 10) {
-          fprintf(stderr, "MISMATCH at point %d: "
-            "orig=(%d,%d,%d) recon=(%d,%d,%d)\n", i,
-            cloud[i][0], cloud[i][1], cloud[i][2],
-            reconPoints[i][0], reconPoints[i][1], reconPoints[i][2]);
-        }
-        mismatchCount++;
-      }
-    }
-    if (mismatchCount)
-      fprintf(stderr, "Total mismatches: %d / %d\n", mismatchCount, (int)numPoints);
-    else
-      fprintf(stderr, "Reconstruction OK: all %d points match.\n", (int)numPoints);
-  }
-
-  // put points in output cloud in coded order (identity in flat mode)
-  for (int i = 0; i < numPoints; i++) {
-    auto srcIdx = codedOrder[i];
-    outCloud[i] = cloud[srcIdx];
-    if (cloud.hasColors())
-      outCloud.setColor(i, cloud.getColor(srcIdx));
-    if (cloud.hasReflectances())
-      outCloud.setReflectance(i, cloud.getReflectance(srcIdx));
-  }
-
-  swap(cloud, outCloud);
-}
 
 //============================================================================
 
@@ -1791,6 +1620,246 @@ encodePredictiveGeometry(
   swap(cloud, outCloud);
 }
 
-//============================================================================
+// ============================================================================
+// Simplified
+// ============================================================================
+void
+PredGeomEncoder::encodePredGeom(const Vec3<int32_t>& residual, const int laserIdx)
+{
+  // Select ring group for context memory
+  //   numGroups=1  → all rings → group 0
+  //   numGroups=32 → each ring → own group
+  const int ringsPerGroup = kNumRings / _numRingGroups;
+  const int g = (laserIdx / ringsPerGroup) % _numRingGroups;
 
+  int k = 0;
+  for (int ctxIdx = 0; k < 3; k++) {
+
+    const auto res = residual[k];
+    _aec->encode(res != 0, _ctxResGt0_g[g][k]);
+    if (!res)
+      continue;
+
+    int32_t value = abs(res) - 1;
+    int32_t numBits = 1 + ilog2(uint32_t(value));
+
+    AdaptiveBitModel* ctxs = &_ctxNumBits_g[g][ctxIdx][k][0] - 1;
+    for (int ctxIdx = 1, n = _pgeom_resid_abs_log2_bits[k] - 1; n >= 0; n--) {
+      auto bin = (numBits >> n) & 1;
+      _aec->encode(bin, ctxs[ctxIdx]);
+      ctxIdx = (ctxIdx << 1) | bin;
+    }
+
+    ctxIdx = std::min(4, (numBits + 1) >> 1);
+
+    --numBits;
+    for (int32_t i = 0; i < numBits; ++i)
+      _aec->encode((value >> i) & 1);
+
+    _aec->encode(res < 0, _ctxSign_g[g][k]);
+  }
+}
+
+// ============================================================================
+
+void
+encodePredictiveGeometry(
+  const PredGeomEncOpts& opt,
+  const GeometryParameterSet& gps,
+  GeometryBrickHeader& gbh,
+  PCCPointSet3& cloud,
+  PredGeomContexts& ctxtMem,
+  EntropyEncoder* arithmeticEncoder,
+  const int* ring,
+  int numGroups)
+{
+  auto numPoints = cloud.getPointCount();
+  //auto numLasers = gps.numLasers();
+
+  // storage for reordering the output point cloud
+  PCCPointSet3 outCloud;
+  outCloud.addRemoveAttributes(cloud.hasColors(), cloud.hasReflectances());
+  outCloud.resize(numPoints);
+
+  std::vector<int32_t> codedOrder(numPoints, -1);
+
+  // Fixed residual bit-depth (simple configuration)
+  for (int k = 0; k < 3; k++) {
+    gbh.pgeom_resid_abs_log2_bits[k] = 5;
+  }
+
+  PredGeomEncoder enc(gps, gbh, opt, ctxtMem, arithmeticEncoder, numGroups);
+
+  const static int kHistSize = 10;
+  const int rAbruptThresh = 500;
+
+  struct RingHist {
+    std::array<point_t, kHistSize> samples = {};
+    std::array<int, kHistSize> rApproxs = {};
+    int count = 0;
+    bool valid = false;
+
+    void push(const point_t& pt, int r) {
+      samples[count % kHistSize] = pt;
+      rApproxs[count % kHistSize] = r;
+      count++;
+      valid = true;
+    }
+
+    point_t closestRadiusSample(int queryR) const {
+      int n = std::min(count, kHistSize);
+      int bestIdx = 0;
+      int bestDiff = std::abs(rApproxs[0] - queryR);
+      for (int i = 1; i < n; i++) {
+        int diff = std::abs(rApproxs[i] - queryR);
+        if (diff < bestDiff) {
+          bestDiff = diff;
+          bestIdx = i;
+        }
+      }
+      return samples[bestIdx];
+    }
+
+    point_t latest() const {
+      return samples[(count - 1) % kHistSize];
+    }
+
+    int latestR() const {
+      return rApproxs[(count - 1) % kHistSize];
+    }
+  };
+
+  // Per-laser history for prediction (indexed by ring/laser ID)
+  std::array<RingHist, kNumRings> hist = {};
+
+  // Reconstruction history (mirrors decoder side)
+  std::array<RingHist, kNumRings> reconHist = {};
+
+  // Storage for reconstructed points
+  std::vector<point_t> reconPoints(numPoints);
+
+  enc.encodeEndOfTreesFlag(false);
+
+  int codedIdx = 0;
+  for (int p = 0; p < numPoints; p++) {
+    const auto& curr = cloud[p];
+    auto absX = std::abs(curr[0]);
+    auto absY = std::abs(curr[1]);
+    int laserIdx = ring[p];
+    int rMin = 2000;     // min radius
+    int rMax = 100000;   // max radius
+    int rApprox = std::max(absX, absY) + static_cast<int>(0.414 * std::min(absX, absY));
+
+    // === Encoder side: compute residual ===
+    // Apply minimum radius threshold
+    if (rApprox >= rMin && rApprox <= rMax) {
+      bool isNewObject = false;
+      point_t pred = 0;
+      
+      if (hist[laserIdx].valid) {
+        int prevR = hist[laserIdx].latestR();
+        isNewObject = std::abs(rApprox - prevR) > rAbruptThresh;
+
+        if (isNewObject) {
+          pred = hist[laserIdx].closestRadiusSample(rApprox);
+        } else {
+          pred = hist[laserIdx].latest();
+        }
+      }
+    
+      point_t residual = curr - pred;
+      
+      // Update encoder history with original point
+      hist[laserIdx].push(curr, rApprox);
+
+      // Encode
+      enc.encodePredGeom(residual, laserIdx);
+
+      // === Decoder-side reconstruction: pred + residual ===
+      point_t reconPred = 0;
+      if (reconHist[laserIdx].valid) {
+        int prevReconR = reconHist[laserIdx].latestR();
+        bool reconIsNewObject = std::abs(rApprox - prevReconR) > rAbruptThresh;
+        
+        if (reconIsNewObject) {
+          reconPred = reconHist[laserIdx].closestRadiusSample(rApprox);
+        } else {
+          reconPred = reconHist[laserIdx].latest();
+        }
+      }
+
+      point_t reconPoint = reconPred + residual;
+
+      auto rAbsX = std::abs(reconPoint[0]);
+      auto rAbsY = std::abs(reconPoint[1]);
+      int reconR = std::max(rAbsX, rAbsY) + static_cast<int>(0.414 * std::min(rAbsX, rAbsY));
+
+      reconHist[laserIdx].push(reconPoint, reconR);
+
+      reconPoints[codedIdx] = reconPoint;
+      codedOrder[codedIdx] = p;
+      codedIdx++;
+    }
+  }
+
+  enc.encodeEndOfTreesFlag(true);
+
+  // save the context state for re-use by a future slice if required
+  ctxtMem = enc.getCtx();
+
+  // ---- Debug: write reconstructed point cloud as PLY ----
+  {
+    std::ofstream ply("recon_debug.ply");
+    ply << "ply\n";
+    ply << "format ascii 1.0\n";
+    ply << "element vertex " << codedIdx << "\n";
+    ply << "property int x\n";
+    ply << "property int y\n";
+    ply << "property int z\n";
+    ply << "property int ring\n";
+    ply << "end_header\n";
+    for (int i = 0; i < codedIdx; i++) {
+      ply << reconPoints[i][0] << " "
+          << reconPoints[i][1] << " "
+          << reconPoints[i][2] << " "
+          << ring[codedOrder[i]] << "\n";
+    }
+    ply.close();
+
+    // Also verify reconstruction matches original
+    int mismatchCount = 0;
+    for (int i = 0; i < codedIdx; i++) {
+      int srcIdx = codedOrder[i];
+      if (reconPoints[i] != cloud[srcIdx]) {
+        if (mismatchCount < 10) {
+          fprintf(stderr, "MISMATCH at point %d: "
+            "orig=(%d,%d,%d) recon=(%d,%d,%d)\n", srcIdx,
+            cloud[srcIdx][0], cloud[srcIdx][1], cloud[srcIdx][2],
+            reconPoints[i][0], reconPoints[i][1], reconPoints[i][2]);
+        }
+        mismatchCount++;
+      }
+    }
+    if (mismatchCount)
+      fprintf(stderr, "Total mismatches: %d / %d\n", mismatchCount, codedIdx);
+    else
+      fprintf(stderr, "Reconstruction OK: all %d points match.\n", codedIdx);
+  }
+
+  // Resize outCloud to match only the encoded points.
+  outCloud.resize(codedIdx);
+
+  // put points in output cloud in coded order (identity in flat mode)
+  for (int i = 0; i < codedIdx; i++) {
+    auto srcIdx = codedOrder[i];
+    outCloud[i] = cloud[srcIdx];
+    if (cloud.hasColors())
+      outCloud.setColor(i, cloud.getColor(srcIdx));
+    if (cloud.hasReflectances())
+      outCloud.setReflectance(i, cloud.getReflectance(srcIdx));
+  }
+
+  swap(cloud, outCloud);
+}
+// ============================================================================
 }  // namespace pcc

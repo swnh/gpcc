@@ -1,5 +1,5 @@
 /* ============================================================================
- * TMC3_simple.cpp
+ * TMC3 PredGeom Only
  *
  * Simplified TMC3 flow:
  *   option setting → PLY read → encodeGeometryBrick → encodePredictiveGeometry
@@ -106,7 +106,7 @@ setupMinimalSPS(SequenceParameterSet& sps)
   sps.frame_ctr_bits = 16;
   sps.slice_tag_bits = 0;
   sps.geometry_axis_order = AxisOrder::kXYZ;
-  sps.cabac_bypass_stream_enabled_flag = false;
+  sps.cabac_bypass_stream_enabled_flag = true;
   sps.bypass_bin_coding_without_prob_update = false;
   sps.entropy_continuation_enabled_flag = false;
   sps.inter_frame_prediction_enabled_flag = false;
