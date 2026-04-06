@@ -1690,7 +1690,7 @@ encodePredictiveGeometry(
 
   PredGeomEncoder enc(gps, gbh, opt, ctxtMem, arithmeticEncoder, numGroups);
 
-  const static int kHistSize = 10;
+  const static int kHistSize = 5;
   const int rAbruptThresh = 500;
 
   struct RingHist {
