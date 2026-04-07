@@ -2,7 +2,7 @@
  * TMC3 PredGeom Only
  *
  * Simplified TMC3 flow:
- *   option setting → PLY read → encodeGeometryBrick → encodePredictiveGeometry
+ *   input PLY -> encode -> write .bin/.ply -> read .bin -> decode -> write decoded .ply -> verify
  *
  * Features kept:
  *   - Internal processing time (wall + user)
@@ -27,6 +27,7 @@
 #include "geometry_params.h"
 #include "hls.h"
 #include "io_hls.h"
+#include "io_tlv.h"
 #include "pcc_chrono.h"
 #include "ply.h"
 #include "PCCPointSet.h"
@@ -39,11 +40,12 @@ using namespace pcc;
 // Minimal parameters for the simplified flow
 // ============================================================================
 struct SimpleParams {
-  string inputPlyPath;         // --input
-  string outputBitstreamPath;  // --output  (raw payload, optional)
-  string reconstructedPath;    // --recon   (reconstructed PLY, optional)
-  double inputScale = 1.0;     // --scale   (position scale for PLY read)
-  int    numGroups  = 1;       // --groups  (ring context groups: 1,2,4,8,16,32)
+  string inputPlyPath;                         // --input
+  string outputBitstreamPath = "predgeom.bin";  // --output
+  string reconstructedPath = "recon.ply";       // --recon
+  string decodedPath = "decoded.ply";           // --decoded
+  double inputScale = 1.0;                      // --scale
+  int    numGroups  = 1;                        // --groups
 };
 
 // ============================================================================
@@ -77,7 +79,8 @@ parseSimpleArgs(int argc, char* argv[], SimpleParams& p)
 {
   if (argc < 3) {
     cerr << "Usage: " << argv[0]
-         << " --input <ply> [--output <bitstream>] [--recon <ply>]"
+         << " --input <ply> [--output <bitstream.bin>] [--recon <recon.ply>]"
+         << " [--decoded <decoded.ply>]"
          << " [--scale <inputScale>] [--groups <1|2|4|8|16|32>]\n";
     return false;
   }
@@ -89,6 +92,8 @@ parseSimpleArgs(int argc, char* argv[], SimpleParams& p)
       p.outputBitstreamPath = argv[++i];
     else if ((arg == "--recon" || arg == "-r") && i + 1 < argc)
       p.reconstructedPath = argv[++i];
+    else if ((arg == "--decoded" || arg == "-d") && i + 1 < argc)
+      p.decodedPath = argv[++i];
     else if ((arg == "--scale" || arg == "-s") && i + 1 < argc)
       p.inputScale = atof(argv[++i]);
     else if ((arg == "--groups" || arg == "-g") && i + 1 < argc)
@@ -231,6 +236,36 @@ isValidNumGroups(int g)
   return g == 1 || g == 2 || g == 4 || g == 8 || g == 16 || g == 32;
 }
 
+static bool
+writeBitstreamFileTlv(const string& path, const PayloadBuffer& payload)
+{
+  ofstream fout(path, ios::binary);
+  if (!fout.is_open())
+    return false;
+  writeTlv(payload, fout);
+  return fout.good();
+}
+
+static bool
+readBitstreamFileTlv(const string& path, PayloadBuffer& payload)
+{
+  ifstream fin(path, ios::binary);
+  if (!fin.is_open())
+    return false;
+  readTlv(fin, &payload);
+  if (!fin || payload.type != PayloadType::kGeometryBrick)
+    return false;
+  return true;
+}
+
+static bool
+writePointCloudPly(const PCCPointSet3& cloud, const string& path)
+{
+  ply::PropertyNameMap names;
+  names.position = {"x", "y", "z"};
+  return ply::write(cloud, names, 0.001, {0, 0, 0}, path, /*ascii=*/true);
+}
+
 // ============================================================================
 //  Main
 // ============================================================================
@@ -336,33 +371,73 @@ main(int argc, char* argv[])
   gbh.footer.geom_num_points_minus1 = cloud.getPointCount() - 1;
 
   // ---- 5. Assemble payload buffer ----
-  // Write GBH header into payload
   write(sps, gps, gbh, &payload);
 
-  // Flush AEC and append to payload
   auto aecLen = aec->stop();
   auto aecBuf = aec->buffer();
   payload.insert(payload.end(), aecBuf, aecBuf + aecLen);
-
-  // Append footer
   write(gps, gbh, gbh.footer, &payload);
-  // ---- 5.5 Decode & Verification ----
-  cout << "\n[3] Decoding & Verification ..." << endl;
+
+  // ---- 6. Write bitstream ----
+  if (!writeBitstreamFileTlv(params.outputBitstreamPath, payload)) {
+    cerr << "Error: could not write bitstream file: " << params.outputBitstreamPath << endl;
+    return 1;
+  }
+  cout << "\n[3] Bitstream written: " << params.outputBitstreamPath
+       << " (" << payload.size() << " B)" << endl;
+
+  // ---- 7. Write encoder reconstruction ----
+  if (!writePointCloudPly(cloud, params.reconstructedPath)) {
+    cerr << "Error: could not write reconstructed PLY: " << params.reconstructedPath << endl;
+    return 1;
+  }
+  cout << "[4] Encoder reconstruction written: " << params.reconstructedPath << endl;
+
+  // ---- 8. Read bitstream file and decode ----
+  cout << "\n[5] Decoding from bitstream file ..." << endl;
+
+  PayloadBuffer payloadIn(PayloadType::kGeometryBrick);
+  if (!readBitstreamFileTlv(params.outputBitstreamPath, payloadIn) || payloadIn.empty()) {
+    cerr << "Error: failed to read bitstream file: " << params.outputBitstreamPath << endl;
+    return 1;
+  }
+
+  int bytesReadHead = 0;
+  int bytesReadFoot = 0;
+  auto gbhFromBitstream = parseGbh(sps, gps, payloadIn, &bytesReadHead, &bytesReadFoot);
+  if (bytesReadHead < 0 || bytesReadFoot < 0
+      || bytesReadHead + bytesReadFoot > int(payloadIn.size())) {
+    cerr << "Error: invalid payload layout while parsing geometry brick." << endl;
+    return 1;
+  }
+
+  const int codedGeomLen = int(payloadIn.size()) - bytesReadHead - bytesReadFoot;
+  if (codedGeomLen <= 0) {
+    cerr << "Error: geometry arithmetic payload is empty." << endl;
+    return 1;
+  }
 
   PCCPointSet3 decCloud;
   PredGeomContexts decCtxtMem;
-  
   std::unique_ptr<EntropyDecoder> aed(new EntropyDecoder());
-  aed->setBuffer(aecLen, aecBuf);
+  aed->setBuffer(codedGeomLen, payloadIn.data() + bytesReadHead);
   aed->enableBypassStream(sps.cabac_bypass_stream_enabled_flag);
   aed->setBypassBinCodingWithoutProbUpdate(sps.bypass_bin_coding_without_prob_update);
   aed->start();
 
   decodePredictiveGeometry(
-    gps, gbh, decCloud,
+    gps, gbhFromBitstream, decCloud,
     decCtxtMem, aed.get(), ringVec.data(), params.numGroups);
 
-  // Verification
+  // ---- 9. Write decoder output ----
+  if (!writePointCloudPly(decCloud, params.decodedPath)) {
+    cerr << "Error: could not write decoded PLY: " << params.decodedPath << endl;
+    return 1;
+  }
+  cout << "[6] Decoded point cloud written: " << params.decodedPath << endl;
+
+  // ---- 10. Verification ----
+  cout << "\n[7] Verification ..." << endl;
   int mismatchCount = 0;
   if (decCloud.getPointCount() != cloud.getPointCount()) {
     cerr << "  Mismatch in point count! Encoded: " << cloud.getPointCount() 
@@ -387,9 +462,9 @@ main(int argc, char* argv[])
     cout << "  Verification FAILED with " << mismatchCount << " mismatched points!" << endl;
   }
 
-  // ---- 6. Report ----
+  // ---- 11. Report ----
   double bpp = double(8 * payload.size()) / numPoints;
-  cout << "\n[4] Results:" << endl;
+  cout << "\n[8] Results:" << endl;
   cout << "  Payload size:     " << payload.size() << " B ("
        << bpp << " bpp)" << endl;
 
@@ -398,33 +473,6 @@ main(int argc, char* argv[])
   auto total_user = duration_cast<milliseconds>(clock_user.count()).count();
   cout << "  Processing time (wall): " << total_wall / 1000.0 << " s" << endl;
   cout << "  Processing time (user): " << total_user / 1000.0 << " s" << endl;
-
-  // ---- 7. Write bitstream (optional) ----
-  if (!params.outputBitstreamPath.empty()) {
-    ofstream fout(params.outputBitstreamPath, ios::binary);
-    if (fout.is_open()) {
-      fout.write(payload.data(), payload.size());
-      fout.close();
-      cout << "  Bitstream written to: " << params.outputBitstreamPath << endl;
-    } else {
-      cerr << "  Warning: could not open output file: "
-           << params.outputBitstreamPath << endl;
-    }
-  }
-
-  // ---- 8. Write reconstructed PLY (optional) ----
-  // After encodePredictiveGeometry, `cloud` has been reordered in coded order.
-  // The reconstruction debug PLY is also written from inside the function.
-  if (!params.reconstructedPath.empty()) {
-    ply::PropertyNameMap reconNames;
-    reconNames.position = {"x", "y", "z"};
-    if (ply::write(cloud, reconNames, 0.001, {0, 0, 0},
-                   params.reconstructedPath, /*ascii=*/true)) {
-      cout << "  Reconstructed PLY: " << params.reconstructedPath << endl;
-    } else {
-      cerr << "  Warning: could not write reconstructed PLY." << endl;
-    }
-  }
 
   cout << "\nDone." << endl;
   return 0;

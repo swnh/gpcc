@@ -43,7 +43,6 @@
 #include "nanoflann.hpp"
 #include <algorithm>
 #include <bitset>
-#include <fstream>
 
 namespace pcc {
 
@@ -1815,13 +1814,9 @@ encodePredictiveGeometry(
   // Reconstruction history (mirrors decoder side)
   std::array<RingHist, kNumRings> reconHist = {};
 
-  // Storage for reconstructed points
-  std::vector<point_t> reconPoints(numPoints);
   std::array<int, kNumRings> ringPointCount = {};
 
   int codedIdx = 0;
-  int newObjCount = 0;
-
   for (int p = 0; p < numPoints; p++) {
     const auto& curr = cloud[p];
     auto absX = std::abs(curr[0]);
@@ -1839,7 +1834,6 @@ encodePredictiveGeometry(
       int histIdx = 0;
       point_t pred = 0;
       int mode = 0;
-      bool isNewObject = false;
       if (hist[laserIdx].valid) {
         auto resNorm = hist[laserIdx].bestNormIdx(curr);
         auto resMode = hist[laserIdx].bestPredMode(curr);
@@ -1858,7 +1852,6 @@ encodePredictiveGeometry(
           histIdx = resNorm.index;
           pred = resNorm.pred;
           mode = 0; // Mode 0 = Boundary / History Match
-          newObjCount++;
         } else {
           mode = resMode.index + 1; // Mode 1, 2, 3 = Dynamic On-Object
           pred = resMode.pred;
@@ -1877,10 +1870,6 @@ encodePredictiveGeometry(
         if (mode == 0) {
           enc.encodeHistIdx(histIdx, laserIdx);
         }
-      }
-      if (p == 9090 || p == 9091) {
-        fprintf(stderr, "ENC p=%d laser=%d valid=%d mode=%d hist=%d res=%d,%d,%d\n",
-          p, laserIdx, hist[laserIdx].valid, mode, histIdx, residual[0], residual[1], residual[2]);
       }
       enc.encodePredGeom(residual, laserIdx);
 
@@ -1902,56 +1891,14 @@ encodePredictiveGeometry(
 
       reconHist[laserIdx].push(reconPoint, reconR);
 
-      reconPoints[codedIdx] = reconPoint;
       codedOrder[codedIdx] = p;
       codedIdx++;
     }
   }
-  fprintf(stderr, "newObjCount: %d\n", newObjCount);
   enc.encodeEndOfTreesFlag(true);
 
   // save the context state for re-use by a future slice if required
   ctxtMem = enc.getCtx();
-
-  // ---- Debug: write reconstructed point cloud as PLY ----
-  {
-    double scale = 0.001;
-    std::ofstream ply("recon_debug.ply");
-    ply << "ply\n";
-    ply << "format ascii 1.0\n";
-    ply << "element vertex " << codedIdx << "\n";
-    ply << "property float x\n";
-    ply << "property float y\n";
-    ply << "property float z\n";
-    ply << "property int ring\n";
-    ply << "end_header\n";
-    for (int i = 0; i < codedIdx; i++) {
-      ply << reconPoints[i][0] * scale << " "
-          << reconPoints[i][1] * scale << " "
-          << reconPoints[i][2] * scale << " "
-          << ring[codedOrder[i]] << "\n";
-    }
-    ply.close();
-
-    // Also verify reconstruction matches original
-    int mismatchCount = 0;
-    for (int i = 0; i < codedIdx; i++) {
-      int srcIdx = codedOrder[i];
-      if (reconPoints[i] != cloud[srcIdx]) {
-        if (mismatchCount < 10) {
-          fprintf(stderr, "MISMATCH at point %d: "
-            "orig=(%d,%d,%d) recon=(%d,%d,%d)\n", srcIdx,
-            cloud[srcIdx][0], cloud[srcIdx][1], cloud[srcIdx][2],
-            reconPoints[i][0], reconPoints[i][1], reconPoints[i][2]);
-        }
-        mismatchCount++;
-      }
-    }
-    if (mismatchCount)
-      fprintf(stderr, "Total mismatches: %d / %d\n", mismatchCount, codedIdx);
-    else
-      fprintf(stderr, "Reconstruction OK: all %d points match.\n", codedIdx);
-  }
 
   // Resize outCloud to match only the encoded points.
   outCloud.resize(codedIdx);
