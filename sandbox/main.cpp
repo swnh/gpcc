@@ -60,6 +60,15 @@ void encodePredictiveGeometry(
   EntropyEncoder* arithmeticEncoder,
   const int* ring,
   int numGroups);
+
+void decodePredictiveGeometry(
+  const GeometryParameterSet& gps,
+  const GeometryBrickHeader& gbh,
+  PCCPointSet3& cloud,
+  PredGeomContexts& ctxtMem,
+  EntropyDecoder* arithmeticDecoder,
+  const int* ring,
+  int numGroups);
 }
 
 // ============================================================================
@@ -216,6 +225,12 @@ makeMinimalPredGeomOpts()
   return opt;
 }
 
+static bool
+isValidNumGroups(int g)
+{
+  return g == 1 || g == 2 || g == 4 || g == 8 || g == 16 || g == 32;
+}
+
 // ============================================================================
 //  Main
 // ============================================================================
@@ -228,6 +243,10 @@ main(int argc, char* argv[])
   SimpleParams params;
   if (!parseSimpleArgs(argc, argv, params))
     return 1;
+  if (!isValidNumGroups(params.numGroups)) {
+    cerr << "Error: --groups must be one of {1,2,4,8,16,32}" << endl;
+    return 1;
+  }
 
   // ---- 2. Read PLY ----
   cout << "[1] Reading PLY: " << params.inputPlyPath << " ..." << endl;
@@ -249,10 +268,24 @@ main(int argc, char* argv[])
 
   // Extract ring array from the cloud (loaded as "laserAngle" / "ring")
   vector<int> ringVec(numPoints, 0);
+  int ringClampedCount = 0;
   if (cloud.hasLaserAngles()) {
-    for (size_t i = 0; i < numPoints; i++)
-      ringVec[i] = cloud.getLaserAngle(i);
+    for (size_t i = 0; i < numPoints; i++) {
+      int ring = cloud.getLaserAngle(i);
+      if (ring < 0) {
+        ring = 0;
+        ringClampedCount++;
+      } else if (ring > 31) {
+        ring = 31;
+        ringClampedCount++;
+      }
+      ringVec[i] = ring;
+    }
     cout << "  Ring/laser data found in PLY." << endl;
+    if (ringClampedCount) {
+      cout << "  WARNING: clamped " << ringClampedCount
+           << " ring values to [0, 31] for predgeom contexts." << endl;
+    }
   } else {
     cout << "  WARNING: no ring/laser data in PLY — using ring=0 for all points." << endl;
   }
@@ -313,10 +346,50 @@ main(int argc, char* argv[])
 
   // Append footer
   write(gps, gbh, gbh.footer, &payload);
+  // ---- 5.5 Decode & Verification ----
+  cout << "\n[3] Decoding & Verification ..." << endl;
+
+  PCCPointSet3 decCloud;
+  PredGeomContexts decCtxtMem;
+  
+  std::unique_ptr<EntropyDecoder> aed(new EntropyDecoder());
+  aed->setBuffer(aecLen, aecBuf);
+  aed->enableBypassStream(sps.cabac_bypass_stream_enabled_flag);
+  aed->setBypassBinCodingWithoutProbUpdate(sps.bypass_bin_coding_without_prob_update);
+  aed->start();
+
+  decodePredictiveGeometry(
+    gps, gbh, decCloud,
+    decCtxtMem, aed.get(), ringVec.data(), params.numGroups);
+
+  // Verification
+  int mismatchCount = 0;
+  if (decCloud.getPointCount() != cloud.getPointCount()) {
+    cerr << "  Mismatch in point count! Encoded: " << cloud.getPointCount() 
+         << ", Decoded: " << decCloud.getPointCount() << endl;
+    mismatchCount++;
+  } else {
+    for (size_t i = 0; i < cloud.getPointCount(); i++) {
+      if (cloud[i] != decCloud[i]) {
+        if (mismatchCount < 10) {
+          cerr << "  Mismatch at point " << i << ": "
+               << "Enc=(" << cloud[i][0] << "," << cloud[i][1] << "," << cloud[i][2] << ") "
+               << "Dec=(" << decCloud[i][0] << "," << decCloud[i][1] << "," << decCloud[i][2] << ")\n";
+        }
+        mismatchCount++;
+      }
+    }
+  }
+
+  if (mismatchCount == 0) {
+    cout << "  Verification OK: all " << decCloud.getPointCount() << " reconstructed points match the encoded points!" << endl;
+  } else {
+    cout << "  Verification FAILED with " << mismatchCount << " mismatched points!" << endl;
+  }
 
   // ---- 6. Report ----
   double bpp = double(8 * payload.size()) / numPoints;
-  cout << "\n[3] Results:" << endl;
+  cout << "\n[4] Results:" << endl;
   cout << "  Payload size:     " << payload.size() << " B ("
        << bpp << " bpp)" << endl;
 

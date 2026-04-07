@@ -1718,8 +1718,6 @@ encodePredictiveGeometry(
 
   PredGeomEncoder enc(gps, gbh, opt, ctxtMem, arithmeticEncoder, numGroups);
 
-  const int rAbruptThresh = 7000;
-
   struct RingHist {
     std::array<point_t, kHistSize> samples = {};
     std::array<int, kHistSize> rApproxs = {};
@@ -1757,9 +1755,9 @@ encodePredictiveGeometry(
     }
 
     PredResult bestPredMode(point_t curr) const {
-      point_t p0 = samples[(count - 1) % kHistSize];
-      point_t p1 = samples[(count - 2) % kHistSize];
-      point_t p2 = samples[(count - 3) % kHistSize];
+      point_t p0 = samples[(count - 1 + kHistSize) % kHistSize];
+      point_t p1 = samples[(count - 2 + kHistSize) % kHistSize];
+      point_t p2 = samples[(count - 3 + kHistSize) % kHistSize];
 
       // Three prediction candidates:
       // Static:       predict = last point
@@ -1797,9 +1795,9 @@ encodePredictiveGeometry(
     }
 
     point_t getModePred(int mode) const {
-      point_t p0 = samples[(count - 1) % kHistSize];
-      point_t p1 = samples[(count - 2) % kHistSize];
-      point_t p2 = samples[(count - 3) % kHistSize];
+      point_t p0 = samples[(count - 1 + kHistSize) % kHistSize];
+      point_t p1 = samples[(count - 2 + kHistSize) % kHistSize];
+      point_t p2 = samples[(count - 3 + kHistSize) % kHistSize];
 
       if (mode == 0) return p0;
       if (mode == 1) return 2 * p0 - p1;
@@ -1820,8 +1818,6 @@ encodePredictiveGeometry(
   // Storage for reconstructed points
   std::vector<point_t> reconPoints(numPoints);
   std::array<int, kNumRings> ringPointCount = {};
-
-  enc.encodeEndOfTreesFlag(false);
 
   int codedIdx = 0;
   int newObjCount = 0;
@@ -1881,6 +1877,10 @@ encodePredictiveGeometry(
         if (mode == 0) {
           enc.encodeHistIdx(histIdx, laserIdx);
         }
+      }
+      if (p == 9090 || p == 9091) {
+        fprintf(stderr, "ENC p=%d laser=%d valid=%d mode=%d hist=%d res=%d,%d,%d\n",
+          p, laserIdx, hist[laserIdx].valid, mode, histIdx, residual[0], residual[1], residual[2]);
       }
       enc.encodePredGeom(residual, laserIdx);
 

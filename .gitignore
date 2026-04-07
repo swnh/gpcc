@@ -1,0 +1,33 @@
+# Build directories
+build/
+**/build/
+
+# CMake generated files
+**/CMakeFiles/
+**/CMakeCache.txt
+**/cmake_install.cmake
+**/Makefile
+
+# Generated binaries / libs / objects
+*.o
+*.o.d
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+
+# Generated sandbox artifacts
+sandbox/predgeom
+sandbox/TMC3Config.h
+sandbox/version.cpp
+sandbox/recon_debug.ply
+build/recon_debug.ply
+build/sandbox/input.ply
+
+# Editor/temp
+*.swp
+*.swo
+*~
+.DS_Store
