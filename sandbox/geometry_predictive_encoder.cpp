@@ -126,9 +126,9 @@ public:
   void encodePredIdx(int predIdx);
 
   //==================================================
-  void encodePredGeom(const Vec3<int32_t>& residual, const int laserIdx);
-  void encodeHistIdx(int histIdx, const int laserIdx);
-  void encodeMode(int mode, const int laserIdx);
+  void encodePredGeom(const Vec3<int32_t>& residual, const int group);
+  void encodeHistIdx(int histIdx, const int group);
+  void encodeMode(int mode, const int group);
   //==================================================
 
   void encodeResidual(const Vec3<int32_t>& residual, int iMode, int multiplier, int rPred, int predIdx, const bool interFlag
@@ -1628,10 +1628,9 @@ encodePredictiveGeometry(
 // Predictive Geometry Coding Cartesian
 // ============================================================================
 void
-PredGeomEncoder::encodeHistIdx(int histIdx, const int laserIdx)
+PredGeomEncoder::encodeHistIdx(int histIdx, const int group)
 {
-  const int ringsPerGroup = kNumRings / _numRingGroups;
-  const int g = (laserIdx / ringsPerGroup) % _numRingGroups;
+  const int g = group;
 
   for (int i = 0; i < histIdx; ++i)
     _aec->encode(1, _ctxHistIdx_g[g][i]);
@@ -1640,10 +1639,9 @@ PredGeomEncoder::encodeHistIdx(int histIdx, const int laserIdx)
 }
 
 void
-PredGeomEncoder::encodeMode(int mode, const int laserIdx)
+PredGeomEncoder::encodeMode(int mode, const int group)
 {
-  const int ringsPerGroup = kNumRings / _numRingGroups;
-  const int g = (laserIdx / ringsPerGroup) % _numRingGroups;
+  const int g = group;
 
   for (int i = 0; i < mode; ++i)
     _aec->encode(1, _ctxPredMode_g[g][i]);
@@ -1653,13 +1651,12 @@ PredGeomEncoder::encodeMode(int mode, const int laserIdx)
 
 
 void
-PredGeomEncoder::encodePredGeom(const Vec3<int32_t>& residual, const int laserIdx)
+PredGeomEncoder::encodePredGeom(const Vec3<int32_t>& residual, const int group)
 {
   // Select ring group for context memory
   //   numGroups=1  → all rings → group 0
   //   numGroups=32 → each ring → own group
-  const int ringsPerGroup = kNumRings / _numRingGroups;
-  const int g = (laserIdx / ringsPerGroup) % _numRingGroups;
+  const int g = group;
 
   int k = 0;
   for (int ctxIdx = 0; k < 3; k++) {
@@ -1698,7 +1695,6 @@ encodePredictiveGeometry(
   PCCPointSet3& cloud,
   PredGeomContexts& ctxtMem,
   EntropyEncoder* arithmeticEncoder,
-  const int* ring,
   int numGroups)
 {
   auto numPoints = cloud.getPointCount();
@@ -1762,6 +1758,9 @@ encodePredictiveGeometry(
       // Static:       predict = last point
       // Velocity:     predict = p0 + (p0 - p1)     = 2*p0 - p1
       // Acceleration: predict = p0 + (p0 - p1) + (p0 - 2*p1 + p2) = 3*p0 - 3*p1 + p2
+      // d1 = p0 - p1;      // first difference (slope)
+      // d2 = d1 - (p1-p2); // second difference (curvature)
+      //pred = p0 + d1 + d2; // = 3*p0 - 3*p1 + p2 (same result)
       point_t preds[3] = {
           p0,
           2 * p0 - p1,
@@ -1825,7 +1824,7 @@ encodePredictiveGeometry(
     int rMax = 200000;   // max radius
     int rApprox = std::max(absX, absY) + static_cast<int>(0.414 * std::min(absX, absY));
 
-    int laserIdx = ring[p];
+    const int laserIdx = p % kNumRings;
     ringPointCount[laserIdx]++;
     
     // === Encoder side: compute residual ===
@@ -1846,7 +1845,7 @@ encodePredictiveGeometry(
         int32_t costMode = l1(resMode.pred, curr);
 
         // Minimal penalty for Mode 0 to offset decoding 'histIdx' bits
-        int32_t mode0Penalty = 150;
+        int32_t mode0Penalty = 200; // required for better performance
 
         if (costNorm + mode0Penalty < costMode) {
           histIdx = resNorm.index;
@@ -1865,13 +1864,19 @@ encodePredictiveGeometry(
       hist[laserIdx].push(curr, rApprox);
 
       // Encode
+      const int ringsPerGroup = kNumRings / numGroups;
+      int ctxGroup = laserIdx / ringsPerGroup;
+      if (ctxGroup < 0)
+        ctxGroup = 0;
+      else if (ctxGroup >= numGroups)
+        ctxGroup = numGroups - 1;
       if (hist[laserIdx].valid) {
-        enc.encodeMode(mode, laserIdx);
+        enc.encodeMode(mode, ctxGroup);
         if (mode == 0) {
-          enc.encodeHistIdx(histIdx, laserIdx);
+          enc.encodeHistIdx(histIdx, ctxGroup);
         }
       }
-      enc.encodePredGeom(residual, laserIdx);
+      enc.encodePredGeom(residual, ctxGroup);
 
       // === Decoder-side reconstruction: pred + residual ===
       point_t reconPred = 0;

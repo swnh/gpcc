@@ -60,7 +60,6 @@ void encodePredictiveGeometry(
   PCCPointSet3& cloud,
   PredGeomContexts& ctxtMem,
   EntropyEncoder* arithmeticEncoder,
-  const int* ring,
   int numGroups);
 
 void decodePredictiveGeometry(
@@ -69,7 +68,6 @@ void decodePredictiveGeometry(
   PCCPointSet3& cloud,
   PredGeomContexts& ctxtMem,
   EntropyDecoder* arithmeticDecoder,
-  const int* ring,
   int numGroups);
 }
 
@@ -301,29 +299,7 @@ main(int argc, char* argv[])
   cout << "  Points loaded: " << numPoints
        << "  (inputScale=" << params.inputScale << ")" << endl;
 
-  // Extract ring array from the cloud (loaded as "laserAngle" / "ring")
-  vector<int> ringVec(numPoints, 0);
-  int ringClampedCount = 0;
-  if (cloud.hasLaserAngles()) {
-    for (size_t i = 0; i < numPoints; i++) {
-      int ring = cloud.getLaserAngle(i);
-      if (ring < 0) {
-        ring = 0;
-        ringClampedCount++;
-      } else if (ring > 31) {
-        ring = 31;
-        ringClampedCount++;
-      }
-      ringVec[i] = ring;
-    }
-    cout << "  Ring/laser data found in PLY." << endl;
-    if (ringClampedCount) {
-      cout << "  WARNING: clamped " << ringClampedCount
-           << " ring values to [0, 31] for predgeom contexts." << endl;
-    }
-  } else {
-    cout << "  WARNING: no ring/laser data in PLY — using ring=0 for all points." << endl;
-  }
+  cout << "  Using implicit laser index cycle: 0..31 (ring field ignored)." << endl;
 
   // ---- 3. Set up minimal parameter sets ----
   SequenceParameterSet sps;
@@ -362,7 +338,7 @@ main(int argc, char* argv[])
 
   encodePredictiveGeometry(
     predGeomOpt, gps, gbh, cloud,
-    ctxtMem, aec.get(), ringVec.data(), params.numGroups);
+    ctxtMem, aec.get(), params.numGroups);
 
   clock_user.stop();
   clock_wall.stop();
@@ -427,7 +403,7 @@ main(int argc, char* argv[])
 
   decodePredictiveGeometry(
     gps, gbhFromBitstream, decCloud,
-    decCtxtMem, aed.get(), ringVec.data(), params.numGroups);
+    decCtxtMem, aed.get(), params.numGroups);
 
   // ---- 9. Write decoder output ----
   if (!writePointCloudPly(decCloud, params.decodedPath)) {

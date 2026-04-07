@@ -83,9 +83,9 @@ public:
   const PredGeomContexts& getCtx() const { return *this; }
 
   //==================================================
-  Vec3<int32_t> decodePredGeom(const int laserIdx);
-  int decodeHistIdx(const int laserIdx);
-  int decodeMode(const int laserIdx);
+  Vec3<int32_t> decodePredGeom(const int group);
+  int decodeHistIdx(const int group);
+  int decodeMode(const int group);
   bool decodeEndOfTreesFlag();
   //==================================================
 
@@ -756,9 +756,8 @@ PredGeomDecoder::decode(
 // Predictive Geometry Coding Cartesian
 // ============================================================================
 
-int PredGeomDecoder::decodeHistIdx(const int laserIdx) {
-  const int ringsPerGroup = kNumRings / _numRingGroups;
-  const int g = (laserIdx / ringsPerGroup) % _numRingGroups;
+int PredGeomDecoder::decodeHistIdx(const int group) {
+  const int g = group;
 
   int histIdx = 0;
   while (histIdx < kHistSize && _aed->decode(_ctxHistIdx_g[g][histIdx])) {
@@ -767,9 +766,8 @@ int PredGeomDecoder::decodeHistIdx(const int laserIdx) {
   return histIdx;
 }
 
-int PredGeomDecoder::decodeMode(const int laserIdx) {
-  const int ringsPerGroup = kNumRings / _numRingGroups;
-  const int g = (laserIdx / ringsPerGroup) % _numRingGroups;
+int PredGeomDecoder::decodeMode(const int group) {
+  const int g = group;
 
   int mode = 0;
   while (mode < 3 && _aed->decode(_ctxPredMode_g[g][mode])) {
@@ -779,10 +777,9 @@ int PredGeomDecoder::decodeMode(const int laserIdx) {
 }
 
 Vec3<int32_t>
-PredGeomDecoder::decodePredGeom(const int laserIdx)
+PredGeomDecoder::decodePredGeom(const int group)
 {
-  const int ringsPerGroup = kNumRings / _numRingGroups;
-  const int g = (laserIdx / ringsPerGroup) % _numRingGroups;
+  const int g = group;
 
   Vec3<int32_t> residual;
   int k = 0;
@@ -852,7 +849,6 @@ void decodePredictiveGeometry(
   PCCPointSet3& cloud,
   PredGeomContexts& ctxtMem,
   EntropyDecoder* arithmeticDecoder,
-  const int* ring,
   int numGroups)
 {
   auto numPoints = gbh.footer.geom_num_points_minus1 + 1;
@@ -897,19 +893,22 @@ void decodePredictiveGeometry(
   std::array<RingHist, kNumRings> reconHist = {};
 
   for (int p = 0; p < numPoints; p++) {
-    int laserIdx = ring[p];
-    if (laserIdx < 0)
-      laserIdx = 0;
-    else if (laserIdx >= kNumRings)
-      laserIdx = kNumRings - 1;
+    const int laserIdx = p % kNumRings;
 
-    int mode = dec.decodeMode(laserIdx);
+    const int ringsPerGroup = kNumRings / numGroups;
+    int ctxGroup = laserIdx / ringsPerGroup;
+    if (ctxGroup < 0)
+      ctxGroup = 0;
+    else if (ctxGroup >= numGroups)
+      ctxGroup = numGroups - 1;
+
+    int mode = dec.decodeMode(ctxGroup);
     int histIdx = 0;
     if (mode == 0) {
-      histIdx = dec.decodeHistIdx(laserIdx);
+      histIdx = dec.decodeHistIdx(ctxGroup);
     }
 
-    Vec3<int32_t> residual = dec.decodePredGeom(laserIdx);
+    Vec3<int32_t> residual = dec.decodePredGeom(ctxGroup);
 
     point_t reconPred = 0;
     if (reconHist[laserIdx].valid) {
