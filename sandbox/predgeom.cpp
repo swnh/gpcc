@@ -128,8 +128,7 @@ public:
 
   //==================================================
   void encodePredGeom(const Vec3<int32_t>& residual, const int laserIdx);
-  void encodeHistIdx(int histIdx, const int laserIdx);
-  void encodeMode(int mode, const int laserIdx);
+  void encodeHistIdx(int histIdx);
   //==================================================
 
   void encodeResidual(const Vec3<int32_t>& residual, int iMode, int multiplier, int rPred, int predIdx, const bool interFlag
@@ -230,8 +229,7 @@ private:
   AdaptiveBitModel _ctxResGt0_g[kMaxRingGroups][3];
   AdaptiveBitModel _ctxSign_g[kMaxRingGroups][3];
   AdaptiveBitModel _ctxNumBits_g[kMaxRingGroups][8][3][31];
-  AdaptiveBitModel _ctxHistIdx_g[kMaxRingGroups][kHistSize];
-  AdaptiveBitModel _ctxPredMode_g[kMaxRingGroups][4];
+  AdaptiveBitModel _ctxHistIdx_g[kHistSize];
 };
 
 //============================================================================
@@ -1625,72 +1623,11 @@ encodePredictiveGeometry(
   swap(cloud, outCloud);
 }
 
+// ============================================================================ 
+// Description : MPEG G-PCC Hardware Implementation Reference Software
+// Author      : Seungwan Noh (VLSI Research Lab, Pusan National University)
+// Date        : 26-04-07
 // ============================================================================
-// Predictive Geometry Coding Cartesian
-// ============================================================================
-void
-PredGeomEncoder::encodeHistIdx(int histIdx, const int laserIdx)
-{
-  const int ringsPerGroup = kNumRings / _numRingGroups;
-  const int g = (laserIdx / ringsPerGroup) % _numRingGroups;
-
-  for (int i = 0; i < histIdx; ++i)
-    _aec->encode(1, _ctxHistIdx_g[g][i]);
-  if (histIdx < kHistSize)
-    _aec->encode(0, _ctxHistIdx_g[g][histIdx]);
-}
-
-void
-PredGeomEncoder::encodeMode(int mode, const int laserIdx)
-{
-  const int ringsPerGroup = kNumRings / _numRingGroups;
-  const int g = (laserIdx / ringsPerGroup) % _numRingGroups;
-
-  for (int i = 0; i < mode; ++i)
-    _aec->encode(1, _ctxPredMode_g[g][i]);
-  if (mode < 3)
-    _aec->encode(0, _ctxPredMode_g[g][mode]);
-}
-
-
-void
-PredGeomEncoder::encodePredGeom(const Vec3<int32_t>& residual, const int laserIdx)
-{
-  // Select ring group for context memory
-  //   numGroups=1  → all rings → group 0
-  //   numGroups=32 → each ring → own group
-  const int ringsPerGroup = kNumRings / _numRingGroups;
-  const int g = (laserIdx / ringsPerGroup) % _numRingGroups;
-
-  int k = 0;
-  for (int ctxIdx = 0; k < 3; k++) {
-    const auto res = residual[k];
-    _aec->encode(res != 0, _ctxResGt0_g[g][k]);
-    if (!res)
-      continue;
-
-    int32_t value = abs(res) - 1;
-    int32_t numBits = 1 + ilog2(uint32_t(value));
-
-    AdaptiveBitModel* ctxs = &_ctxNumBits_g[g][ctxIdx][k][0] - 1;
-    for (int ctxIdx = 1, n = _pgeom_resid_abs_log2_bits[k] - 1; n >= 0; n--) {
-      auto bin = (numBits >> n) & 1;
-      _aec->encode(bin, ctxs[ctxIdx]);
-      ctxIdx = (ctxIdx << 1) | bin;
-    }
-
-    ctxIdx = std::min(7, (numBits + 1) >> 1);
-
-    --numBits;
-    for (int32_t i = 0; i < numBits; ++i)
-      _aec->encode((value >> i) & 1);
-
-    _aec->encode(res < 0, _ctxSign_g[g][k]);
-  }
-}
-
-// ============================================================================
-
 void
 encodePredictiveGeometry(
   const PredGeomEncOpts& opt,
@@ -1718,7 +1655,8 @@ encodePredictiveGeometry(
 
   PredGeomEncoder enc(gps, gbh, opt, ctxtMem, arithmeticEncoder, numGroups);
 
-  const int rAbruptThresh = 7000;
+  const int rAbruptThresh = 2048;
+}
 
   struct RingHist {
     std::array<point_t, kHistSize> samples = {};
@@ -1733,30 +1671,27 @@ encodePredictiveGeometry(
       valid = true;
     }
 
-    struct PredResult {
-      int index;
-      point_t pred;
-    };
-
-    PredResult bestNormIdx(point_t curr) const {
+    point_t bestNormIdx(point_t pt) const {
       int n = std::min(count, kHistSize);
       int bestIdx = 0;
-      int bestNorm = std::abs(curr[0] - samples[bestIdx][0])
-                   + std::abs(curr[1] - samples[bestIdx][1])
-                   + std::abs(curr[2] - samples[bestIdx][2]);
+      int bestNorm = std::abs(pt[0] - samples[bestIdx][0])
+                   + std::abs(pt[1] - samples[bestIdx][1])
+                   + std::abs(pt[2] - samples[bestIdx][2]);
+    
       for (int i = 1; i < n; i++) {
-        int norm = std::abs(curr[0] - samples[i][0])
-                 + std::abs(curr[1] - samples[i][1])
-                 + std::abs(curr[2] - samples[i][2]);
+        int norm = std::abs(pt[0] - samples[i][0])
+                 + std::abs(pt[1] - samples[i][1])
+                 + std::abs(pt[2] - samples[i][2]);
         if (norm < bestNorm) {
-          bestNorm = norm;
-          bestIdx = i;
+            bestNorm = norm;
+            bestIdx = i;
         }
       }
-      return {bestIdx, samples[bestIdx]};
+
+      return bestIdx;
     }
 
-    PredResult bestPredMode(point_t curr) const {
+    point_t bestPredMode(point_t curr) const {
       point_t p0 = samples[(count - 1) % kHistSize];
       point_t p1 = samples[(count - 2) % kHistSize];
       point_t p2 = samples[(count - 3) % kHistSize];
@@ -1789,186 +1724,33 @@ encodePredictiveGeometry(
           }
       }
 
-      return {best, preds[best]};
-    }
-
-    point_t getNormPred(int idx) const {
-      return samples[idx];
-    }
-
-    point_t getModePred(int mode) const {
-      point_t p0 = samples[(count - 1) % kHistSize];
-      point_t p1 = samples[(count - 2) % kHistSize];
-      point_t p2 = samples[(count - 3) % kHistSize];
-
-      if (mode == 0) return p0;
-      if (mode == 1) return 2 * p0 - p1;
-      return 3 * p0 - 3 * p1 + p2;
+      return preds[best], best;
     }
 
     int latestR() const {
-      return rApproxs[(count - 1) % kHistSize];
+        return rApproxs[(count - 1) & kHistSize];
     }
+
   };
 
-  // Per-laser history for prediction (indexed by ring/laser ID)
   std::array<RingHist, kNumRings> hist = {};
-
-  // Reconstruction history (mirrors decoder side)
   std::array<RingHist, kNumRings> reconHist = {};
-
-  // Storage for reconstructed points
   std::vector<point_t> reconPoints(numPoints);
   std::array<int, kNumRings> ringPointCount = {};
 
   enc.encodeEndOfTreesFlag(false);
 
-  int codedIdx = 0;
-  int newObjCount = 0;
-
   for (int p = 0; p < numPoints; p++) {
     const auto& curr = cloud[p];
     auto absX = std::abs(curr[0]);
     auto absY = std::abs(curr[1]);
-    int rMin = 0;     // min radius
+
+    int rMin = 0;        // min radius
     int rMax = 200000;   // max radius
     int rApprox = std::max(absX, absY) + static_cast<int>(0.414 * std::min(absX, absY));
 
     int laserIdx = ring[p];
     ringPointCount[laserIdx]++;
-    
-    // === Encoder side: compute residual ===
-    // Apply minimum radius threshold
-    if (rApprox >= rMin && rApprox <= rMax) {
-      int histIdx = 0;
-      point_t pred = 0;
-      int mode = 0;
-      bool isNewObject = false;
-      if (hist[laserIdx].valid) {
-        auto resNorm = hist[laserIdx].bestNormIdx(curr);
-        auto resMode = hist[laserIdx].bestPredMode(curr);
-
-        auto l1 = [](point_t a, point_t b) -> int32_t {
-          return std::abs(a[0] - b[0]) + std::abs(a[1] - b[1]) + std::abs(a[2] - b[2]);
-        };
-
-        int32_t costNorm = l1(resNorm.pred, curr);
-        int32_t costMode = l1(resMode.pred, curr);
-
-        // Minimal penalty for Mode 0 to offset decoding 'histIdx' bits
-        int32_t mode0Penalty = 150;
-
-        if (costNorm + mode0Penalty < costMode) {
-          histIdx = resNorm.index;
-          pred = resNorm.pred;
-          mode = 0; // Mode 0 = Boundary / History Match
-          newObjCount++;
-        } else {
-          mode = resMode.index + 1; // Mode 1, 2, 3 = Dynamic On-Object
-          pred = resMode.pred;
-          histIdx = 0;
-        }
-      }
-  
-      point_t residual = curr - pred;
-      
-      // Update encoder history with original point
-      hist[laserIdx].push(curr, rApprox);
-
-      // Encode
-      if (hist[laserIdx].valid) {
-        enc.encodeMode(mode, laserIdx);
-        if (mode == 0) {
-          enc.encodeHistIdx(histIdx, laserIdx);
-        }
-      }
-      enc.encodePredGeom(residual, laserIdx);
-
-      // === Decoder-side reconstruction: pred + residual ===
-      point_t reconPred = 0;
-      if (reconHist[laserIdx].valid) {
-        if (mode == 0) {
-          reconPred = reconHist[laserIdx].getNormPred(histIdx);
-        } else {
-          reconPred = reconHist[laserIdx].getModePred(mode - 1);
-        }
-      }
-
-      point_t reconPoint = reconPred + residual;
-
-      auto rAbsX = std::abs(reconPoint[0]);
-      auto rAbsY = std::abs(reconPoint[1]);
-      int reconR = std::max(rAbsX, rAbsY) + static_cast<int>(0.414 * std::min(rAbsX, rAbsY));
-
-      reconHist[laserIdx].push(reconPoint, reconR);
-
-      reconPoints[codedIdx] = reconPoint;
-      codedOrder[codedIdx] = p;
-      codedIdx++;
-    }
   }
-  fprintf(stderr, "newObjCount: %d\n", newObjCount);
-  enc.encodeEndOfTreesFlag(true);
-
-  // save the context state for re-use by a future slice if required
-  ctxtMem = enc.getCtx();
-
-  // ---- Debug: write reconstructed point cloud as PLY ----
-  {
-    double scale = 0.001;
-    std::ofstream ply("recon_debug.ply");
-    ply << "ply\n";
-    ply << "format ascii 1.0\n";
-    ply << "element vertex " << codedIdx << "\n";
-    ply << "property float x\n";
-    ply << "property float y\n";
-    ply << "property float z\n";
-    ply << "property int ring\n";
-    ply << "end_header\n";
-    for (int i = 0; i < codedIdx; i++) {
-      ply << reconPoints[i][0] * scale << " "
-          << reconPoints[i][1] * scale << " "
-          << reconPoints[i][2] * scale << " "
-          << ring[codedOrder[i]] << "\n";
-    }
-    ply.close();
-
-    // Also verify reconstruction matches original
-    int mismatchCount = 0;
-    for (int i = 0; i < codedIdx; i++) {
-      int srcIdx = codedOrder[i];
-      if (reconPoints[i] != cloud[srcIdx]) {
-        if (mismatchCount < 10) {
-          fprintf(stderr, "MISMATCH at point %d: "
-            "orig=(%d,%d,%d) recon=(%d,%d,%d)\n", srcIdx,
-            cloud[srcIdx][0], cloud[srcIdx][1], cloud[srcIdx][2],
-            reconPoints[i][0], reconPoints[i][1], reconPoints[i][2]);
-        }
-        mismatchCount++;
-      }
-    }
-    if (mismatchCount)
-      fprintf(stderr, "Total mismatches: %d / %d\n", mismatchCount, codedIdx);
-    else
-      fprintf(stderr, "Reconstruction OK: all %d points match.\n", codedIdx);
-  }
-
-  // Resize outCloud to match only the encoded points.
-  outCloud.resize(codedIdx);
-
-  // put points in output cloud in coded order (identity in flat mode)
-  for (int i = 0; i < codedIdx; i++) {
-    auto srcIdx = codedOrder[i];
-    outCloud[i] = cloud[srcIdx];
-    if (cloud.hasColors())
-      outCloud.setColor(i, cloud.getColor(srcIdx));
-    if (cloud.hasReflectances())
-      outCloud.setReflectance(i, cloud.getReflectance(srcIdx));
-  }
-
-  swap(cloud, outCloud);
-}
-
-
 // ============================================================================
 }  // namespace pcc
