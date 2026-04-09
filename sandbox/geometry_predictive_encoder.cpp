@@ -81,7 +81,63 @@ namespace {
 // Max ring groups for context array sizing (compile-time)
 static const int kMaxRingGroups = 32;
 static const int kNumRings = 32;
-static const int kHistSize = 3;
+static const int kHistSize = 7;
+static const int kCartesianRangeClasses = 3;
+static const int kCartesianBoundaryClasses = 2;
+static const int kCartesianPredModes = 6;
+
+namespace {
+
+enum CartesianPredMode
+{
+  kPredZero = 0,
+  kPredSameRingLast = 1,
+  kPredSameRingLinear2 = 2,
+  kPredCrossRingUp = 3,
+  kPredCrossRingDown = 4,
+  kPredFusedPrevPhi = 5,
+};
+
+inline int
+clampLaserIdx(const PCCPointSet3& cloud, int idx)
+{
+  if (!cloud.hasLaserAngles())
+    return std::max(0, std::min(kNumRings - 1, idx));
+  return std::max(0, std::min(kNumRings - 1, cloud.getLaserAngle(idx)));
+}
+
+inline int
+computeRApprox(const point_t& pt)
+{
+  auto absX = std::abs(pt[0]);
+  auto absY = std::abs(pt[1]);
+  return std::max(absX, absY) + ((424 * std::min(absX, absY)) >> 10);
+}
+
+inline int
+computeRangeClass(int rApprox)
+{
+  if (rApprox < 1 << 10)
+    return 0;
+  if (rApprox < 1 << 12)
+    return 1;
+  return 2;
+}
+
+inline int
+modeBias(int mode)
+{
+  static const int kModeBias[kCartesianPredModes] = {96, 24, 28, 48, 48, 36};
+  return kModeBias[mode];
+}
+
+inline int
+boundaryThreshold()
+{
+  return 384;
+}
+
+}  // namespace
 
 class PredGeomEncoder : protected PredGeomContexts {
 public:
@@ -126,9 +182,13 @@ public:
   void encodePredIdx(int predIdx);
 
   //==================================================
-  void encodePredGeom(const Vec3<int32_t>& residual, const int group);
-  void encodeHistIdx(int histIdx, const int group);
-  void encodeMode(int mode, const int group);
+  void encodePredGeom(
+    const Vec3<int32_t>& residual,
+    int group,
+    int mode,
+    int rangeClass,
+    bool boundary);
+  void encodeMode(int mode, int group, int rangeClass, bool boundary);
   //==================================================
 
   void encodeResidual(const Vec3<int32_t>& residual, int iMode, int multiplier, int rPred, int predIdx, const bool interFlag
@@ -226,11 +286,14 @@ private:
 
   // ---- Per-ring-group context arrays (used by encodePredGeom) ----
   int _numRingGroups;  // runtime: 1, 2, 4, 8, 16, or 32
-  AdaptiveBitModel _ctxResGt0_g[kMaxRingGroups][3];
-  AdaptiveBitModel _ctxSign_g[kMaxRingGroups][3];
-  AdaptiveBitModel _ctxNumBits_g[kMaxRingGroups][8][3][31];
-  AdaptiveBitModel _ctxHistIdx_g[kMaxRingGroups][kHistSize];
-  AdaptiveBitModel _ctxPredMode_g[kMaxRingGroups][4];
+  AdaptiveBitModel _ctxResGt0_g[kMaxRingGroups][kCartesianRangeClasses]
+                              [kCartesianBoundaryClasses][kCartesianPredModes][3];
+  AdaptiveBitModel _ctxSign_g[kMaxRingGroups][kCartesianRangeClasses]
+                             [kCartesianBoundaryClasses][3];
+  AdaptiveBitModel _ctxNumBits_g[kMaxRingGroups][kCartesianRangeClasses]
+                                [kCartesianBoundaryClasses][8][3][31];
+  AdaptiveBitModel _ctxPredMode_g[kMaxRingGroups][kCartesianRangeClasses]
+                                 [kCartesianBoundaryClasses][kCartesianPredModes];
 };
 
 //============================================================================
@@ -1628,47 +1691,43 @@ encodePredictiveGeometry(
 // Predictive Geometry Coding Cartesian
 // ============================================================================
 void
-PredGeomEncoder::encodeHistIdx(int histIdx, const int group)
+PredGeomEncoder::encodeMode(int mode, int group, int rangeClass, bool boundary)
 {
   const int g = group;
-
-  for (int i = 0; i < histIdx; ++i)
-    _aec->encode(1, _ctxHistIdx_g[g][i]);
-  if (histIdx < kHistSize)
-    _aec->encode(0, _ctxHistIdx_g[g][histIdx]);
-}
-
-void
-PredGeomEncoder::encodeMode(int mode, const int group)
-{
-  const int g = group;
+  const int rc = std::max(0, std::min(kCartesianRangeClasses - 1, rangeClass));
+  const int bc = boundary ? 1 : 0;
 
   for (int i = 0; i < mode; ++i)
-    _aec->encode(1, _ctxPredMode_g[g][i]);
-  if (mode < 3)
-    _aec->encode(0, _ctxPredMode_g[g][mode]);
+    _aec->encode(1, _ctxPredMode_g[g][rc][bc][i]);
+  if (mode < kCartesianPredModes - 1)
+    _aec->encode(0, _ctxPredMode_g[g][rc][bc][mode]);
 }
 
 
 void
-PredGeomEncoder::encodePredGeom(const Vec3<int32_t>& residual, const int group)
+PredGeomEncoder::encodePredGeom(
+  const Vec3<int32_t>& residual,
+  int group,
+  int mode,
+  int rangeClass,
+  bool boundary)
 {
-  // Select ring group for context memory
-  //   numGroups=1  → all rings → group 0
-  //   numGroups=32 → each ring → own group
   const int g = group;
+  const int rc = std::max(0, std::min(kCartesianRangeClasses - 1, rangeClass));
+  const int bc = boundary ? 1 : 0;
+  const int mc = std::max(0, std::min(kCartesianPredModes - 1, mode));
 
   int k = 0;
   for (int ctxIdx = 0; k < 3; k++) {
     const auto res = residual[k];
-    _aec->encode(res != 0, _ctxResGt0_g[g][k]);
+    _aec->encode(res != 0, _ctxResGt0_g[g][rc][bc][mc][k]);
     if (!res)
       continue;
 
     int32_t value = abs(res) - 1;
     int32_t numBits = 1 + ilog2(uint32_t(value));
 
-    AdaptiveBitModel* ctxs = &_ctxNumBits_g[g][ctxIdx][k][0] - 1;
+    AdaptiveBitModel* ctxs = &_ctxNumBits_g[g][rc][bc][ctxIdx][k][0] - 1;
     for (int ctxIdx = 1, n = _pgeom_resid_abs_log2_bits[k] - 1; n >= 0; n--) {
       auto bin = (numBits >> n) & 1;
       _aec->encode(bin, ctxs[ctxIdx]);
@@ -1681,7 +1740,7 @@ PredGeomEncoder::encodePredGeom(const Vec3<int32_t>& residual, const int group)
     for (int32_t i = 0; i < numBits; ++i)
       _aec->encode((value >> i) & 1);
 
-    _aec->encode(res < 0, _ctxSign_g[g][k]);
+    _aec->encode(res < 0, _ctxSign_g[g][rc][bc][k]);
   }
 }
 
@@ -1699,9 +1758,10 @@ encodePredictiveGeometry(
 {
   auto numPoints = cloud.getPointCount();
 
-  // storage for reordering the output point cloud
   PCCPointSet3 outCloud;
   outCloud.addRemoveAttributes(cloud.hasColors(), cloud.hasReflectances());
+  if (cloud.hasLaserAngles())
+    outCloud.addLaserAngles();
   outCloud.resize(numPoints);
 
   std::vector<int32_t> codedOrder(numPoints, -1);
@@ -1713,192 +1773,198 @@ encodePredictiveGeometry(
 
   PredGeomEncoder enc(gps, gbh, opt, ctxtMem, arithmeticEncoder, numGroups);
 
-  struct RingHist {
-    std::array<point_t, kHistSize> samples = {};
-    std::array<int, kHistSize> rApproxs = {};
+  struct RingState {
+    point_t last = 0;
+    point_t prev = 0;
+    int lastR = 0;
+    int prevR = 0;
     int count = 0;
-    bool valid = false;
 
-    void push(const point_t& pt, int r) {
-      samples[count % kHistSize] = pt;
-      rApproxs[count % kHistSize] = r;
-      count++;
-      valid = true;
-    }
+    bool hasLast() const { return count >= 1; }
+    bool hasPrev() const { return count >= 2; }
 
-    struct PredResult {
-      int index;
-      point_t pred;
-    };
-
-    PredResult bestNormIdx(point_t curr) const {
-      int n = std::min(count, kHistSize);
-      int bestIdx = 0;
-      int bestNorm = std::abs(curr[0] - samples[bestIdx][0])
-                   + std::abs(curr[1] - samples[bestIdx][1])
-                   + std::abs(curr[2] - samples[bestIdx][2]);
-      for (int i = 1; i < n; i++) {
-        int norm = std::abs(curr[0] - samples[i][0])
-                 + std::abs(curr[1] - samples[i][1])
-                 + std::abs(curr[2] - samples[i][2]);
-        if (norm < bestNorm) {
-          bestNorm = norm;
-          bestIdx = i;
-        }
-      }
-      return {bestIdx, samples[bestIdx]};
-    }
-
-    PredResult bestPredMode(point_t curr) const {
-      point_t p0 = samples[(count - 1 + kHistSize) % kHistSize];
-      point_t p1 = samples[(count - 2 + kHistSize) % kHistSize];
-      point_t p2 = samples[(count - 3 + kHistSize) % kHistSize];
-
-      // Three prediction candidates:
-      // Static:       predict = last point
-      // Velocity:     predict = p0 + (p0 - p1)     = 2*p0 - p1
-      // Acceleration: predict = p0 + (p0 - p1) + (p0 - 2*p1 + p2) = 3*p0 - 3*p1 + p2
-      // d1 = p0 - p1;      // first difference (slope)
-      // d2 = d1 - (p1-p2); // second difference (curvature)
-      //pred = p0 + d1 + d2; // = 3*p0 - 3*p1 + p2 (same result)
-      point_t preds[3] = {
-          p0,
-          2 * p0 - p1,
-          3 * p0 - 3 * p1 + p2
-      };
-
-      // L1 norm cost (Manhattan distance) — branchless abs via lambda
-      auto l1 = [](point_t a, point_t b) -> int32_t {
-          auto d = a - b;
-          return std::abs(d.x()) + std::abs(d.y()) + std::abs(d.z());
-      };
-
-      // Find the prediction with minimum cost against curr
-      int best = 0;
-      int32_t bestCost = l1(preds[0], curr);
-
-      for (int i = 1; i < 3; i++) {
-          int32_t cost = l1(preds[i], curr);
-          if (cost < bestCost) {
-              bestCost = cost;
-              best = i;
-          }
-      }
-
-      return {best, preds[best]};
-    }
-
-    point_t getNormPred(int idx) const {
-      return samples[idx];
-    }
-
-    point_t getModePred(int mode) const {
-      point_t p0 = samples[(count - 1 + kHistSize) % kHistSize];
-      point_t p1 = samples[(count - 2 + kHistSize) % kHistSize];
-      point_t p2 = samples[(count - 3 + kHistSize) % kHistSize];
-
-      if (mode == 0) return p0;
-      if (mode == 1) return 2 * p0 - p1;
-      return 3 * p0 - 3 * p1 + p2;
-    }
-
-    int latestR() const {
-      return rApproxs[(count - 1) % kHistSize];
+    void push(const point_t& pt, int rApprox)
+    {
+      prev = last;
+      prevR = lastR;
+      last = pt;
+      lastR = rApprox;
+      count = std::min(count + 1, 2);
     }
   };
 
-  // Per-laser history for prediction (indexed by ring/laser ID)
-  std::array<RingHist, kNumRings> hist = {};
+  struct Candidate {
+    int mode = kPredZero;
+    point_t pred = 0;
+    int predR = 0;
+    int rangeClass = 0;
+    bool boundary = false;
+    bool valid = true;
+  };
 
-  // Reconstruction history (mirrors decoder side)
-  std::array<RingHist, kNumRings> reconHist = {};
+  std::array<RingState, kNumRings> reconState = {};
 
-  std::array<int, kNumRings> ringPointCount = {};
+  auto ctxGroupForLaser = [numGroups](int laserIdx) {
+    const int ringsPerGroup = std::max(1, kNumRings / numGroups);
+    return std::min(numGroups - 1, std::max(0, laserIdx / ringsPerGroup));
+  };
+
+  auto roundedDiv = [](int sum, int div) {
+    if (sum >= 0)
+      return (sum + (div >> 1)) / div;
+    return -((-sum + (div >> 1)) / div);
+  };
+
+  auto makeCandidate = [&](int laserIdx, int mode) {
+    Candidate cand;
+    cand.mode = mode;
+    cand.valid = true;
+
+    const auto& same = reconState[laserIdx];
+    const auto* up = laserIdx > 0 ? &reconState[laserIdx - 1] : nullptr;
+    const auto* down = laserIdx + 1 < kNumRings ? &reconState[laserIdx + 1] : nullptr;
+
+    switch (mode) {
+    case kPredZero:
+      cand.pred = 0;
+      cand.predR = 0;
+      cand.boundary = false;
+      break;
+
+    case kPredSameRingLast:
+      cand.valid = same.hasLast();
+      if (cand.valid) {
+        cand.pred = same.last;
+        cand.predR = same.lastR;
+        cand.boundary = same.hasPrev()
+          && std::abs(same.lastR - same.prevR) > boundaryThreshold();
+      }
+      break;
+
+    case kPredSameRingLinear2:
+      cand.valid = same.hasPrev();
+      if (cand.valid) {
+        cand.pred = same.last * 2 - same.prev;
+        cand.predR = computeRApprox(cand.pred);
+        cand.boundary = std::abs(same.lastR - same.prevR) > boundaryThreshold();
+      }
+      break;
+
+    case kPredCrossRingUp:
+      cand.valid = up && up->hasLast();
+      if (cand.valid) {
+        cand.pred = up->last;
+        cand.predR = up->lastR;
+        cand.boundary = same.hasLast()
+          && std::abs(up->lastR - same.lastR) > boundaryThreshold();
+      }
+      break;
+
+    case kPredCrossRingDown:
+      cand.valid = down && down->hasLast();
+      if (cand.valid) {
+        cand.pred = down->last;
+        cand.predR = down->lastR;
+        cand.boundary = same.hasLast()
+          && std::abs(down->lastR - same.lastR) > boundaryThreshold();
+      }
+      break;
+
+    case kPredFusedPrevPhi: {
+      int sum[3] = {};
+      int count = 0;
+      bool boundary = false;
+      cand.valid = same.hasLast();
+      if (same.hasLast()) {
+        for (int k = 0; k < 3; k++)
+          sum[k] += same.last[k];
+        count++;
+      }
+      if (up && up->hasLast()) {
+        for (int k = 0; k < 3; k++)
+          sum[k] += up->last[k];
+        count++;
+        boundary |= same.hasLast()
+          && std::abs(up->lastR - same.lastR) > boundaryThreshold();
+      }
+      if (down && down->hasLast()) {
+        for (int k = 0; k < 3; k++)
+          sum[k] += down->last[k];
+        count++;
+        boundary |= same.hasLast()
+          && std::abs(down->lastR - same.lastR) > boundaryThreshold();
+      }
+      cand.valid = count >= 2;
+      if (cand.valid) {
+        for (int k = 0; k < 3; k++)
+          cand.pred[k] = roundedDiv(sum[k], count);
+        cand.predR = computeRApprox(cand.pred);
+        cand.boundary = boundary;
+      }
+      break;
+    }
+
+    default:
+      cand.valid = false;
+      break;
+    }
+
+    cand.rangeClass = computeRangeClass(cand.predR);
+    return cand;
+  };
+
+  auto residualCost = [](const point_t& a, const point_t& b) {
+    return std::abs(a[0] - b[0]) + std::abs(a[1] - b[1]) + std::abs(a[2] - b[2]);
+  };
 
   int codedIdx = 0;
   for (int p = 0; p < numPoints; p++) {
     const auto& curr = cloud[p];
-    auto absX = std::abs(curr[0]);
-    auto absY = std::abs(curr[1]);
-    int rMin = 0;     // min radius
-    int rMax = 200000;   // max radius
-    int rApprox = std::max(absX, absY) + static_cast<int>(0.414 * std::min(absX, absY));
-
-    const int laserIdx = p % kNumRings;
-    ringPointCount[laserIdx]++;
-    
-    // === Encoder side: compute residual ===
-    // Apply minimum radius threshold
-    if (rApprox >= rMin && rApprox <= rMax) {
-      int histIdx = 0;
-      point_t pred = 0;
-      int mode = 0;
-      if (hist[laserIdx].valid) {
-        auto resNorm = hist[laserIdx].bestNormIdx(curr);
-        auto resMode = hist[laserIdx].bestPredMode(curr);
-
-        auto l1 = [](point_t a, point_t b) -> int32_t {
-          return std::abs(a[0] - b[0]) + std::abs(a[1] - b[1]) + std::abs(a[2] - b[2]);
-        };
-
-        int32_t costNorm = l1(resNorm.pred, curr);
-        int32_t costMode = l1(resMode.pred, curr);
-
-        // Minimal penalty for Mode 0 to offset decoding 'histIdx' bits
-        int32_t mode0Penalty = 200; // required for better performance
-
-        if (costNorm + mode0Penalty < costMode) {
-          histIdx = resNorm.index;
-          pred = resNorm.pred;
-          mode = 0; // Mode 0 = Boundary / History Match
-        } else {
-          mode = resMode.index + 1; // Mode 1, 2, 3 = Dynamic On-Object
-          pred = resMode.pred;
-          histIdx = 0;
-        }
-      }
-  
-      point_t residual = curr - pred;
-      
-      // Update encoder history with original point
-      hist[laserIdx].push(curr, rApprox);
-
-      // Encode
-      const int ringsPerGroup = kNumRings / numGroups;
-      int ctxGroup = laserIdx / ringsPerGroup;
-      if (ctxGroup < 0)
-        ctxGroup = 0;
-      else if (ctxGroup >= numGroups)
-        ctxGroup = numGroups - 1;
-      if (hist[laserIdx].valid) {
-        enc.encodeMode(mode, ctxGroup);
-        if (mode == 0) {
-          enc.encodeHistIdx(histIdx, ctxGroup);
-        }
-      }
-      enc.encodePredGeom(residual, ctxGroup);
-
-      // === Decoder-side reconstruction: pred + residual ===
-      point_t reconPred = 0;
-      if (reconHist[laserIdx].valid) {
-        if (mode == 0) {
-          reconPred = reconHist[laserIdx].getNormPred(histIdx);
-        } else {
-          reconPred = reconHist[laserIdx].getModePred(mode - 1);
-        }
-      }
-
-      point_t reconPoint = reconPred + residual;
-
-      auto rAbsX = std::abs(reconPoint[0]);
-      auto rAbsY = std::abs(reconPoint[1]);
-      int reconR = std::max(rAbsX, rAbsY) + static_cast<int>(0.414 * std::min(rAbsX, rAbsY));
-
-      reconHist[laserIdx].push(reconPoint, reconR);
-
-      codedOrder[codedIdx] = p;
-      codedIdx++;
+    const int laserIdx = clampLaserIdx(cloud, p);
+    const int currR = computeRApprox(curr);
+    int modeRangeClass = 0;
+    bool modeBoundary = false;
+    if (reconState[laserIdx].hasLast()) {
+      modeRangeClass = computeRangeClass(reconState[laserIdx].lastR);
+      modeBoundary = reconState[laserIdx].hasPrev()
+        && std::abs(reconState[laserIdx].lastR - reconState[laserIdx].prevR)
+             > boundaryThreshold();
     }
+
+    Candidate best;
+    int bestCost = std::numeric_limits<int>::max();
+    for (int mode = 0; mode < kCartesianPredModes; mode++) {
+      auto cand = makeCandidate(laserIdx, mode);
+      if (!cand.valid)
+        continue;
+
+      if (mode >= kPredCrossRingUp
+          && std::abs(currR - cand.predR) > (boundaryThreshold() << 1)) {
+        continue;
+      }
+
+      int cost = residualCost(curr, cand.pred) + modeBias(mode);
+      if (cand.boundary && mode >= kPredCrossRingUp)
+        cost += 24;
+
+      if (cost < bestCost) {
+        best = cand;
+        bestCost = cost;
+      }
+    }
+
+    const point_t residual = curr - best.pred;
+    const int ctxGroup = ctxGroupForLaser(laserIdx);
+
+    enc.encodeMode(best.mode, ctxGroup, modeRangeClass, modeBoundary);
+    enc.encodePredGeom(
+      residual, ctxGroup, best.mode, best.rangeClass, best.boundary);
+
+    const point_t reconPoint = best.pred + residual;
+    reconState[laserIdx].push(reconPoint, computeRApprox(reconPoint));
+
+    codedOrder[codedIdx] = p;
+    codedIdx++;
   }
   enc.encodeEndOfTreesFlag(true);
 
@@ -1912,6 +1978,8 @@ encodePredictiveGeometry(
   for (int i = 0; i < codedIdx; i++) {
     auto srcIdx = codedOrder[i];
     outCloud[i] = cloud[srcIdx];
+    if (cloud.hasLaserAngles())
+      outCloud.setLaserAngle(i, cloud.getLaserAngle(srcIdx));
     if (cloud.hasColors())
       outCloud.setColor(i, cloud.getColor(srcIdx));
     if (cloud.hasReflectances())

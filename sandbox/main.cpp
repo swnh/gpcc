@@ -299,7 +299,10 @@ main(int argc, char* argv[])
   cout << "  Points loaded: " << numPoints
        << "  (inputScale=" << params.inputScale << ")" << endl;
 
-  cout << "  Using implicit laser index cycle: 0..31 (ring field ignored)." << endl;
+  if (cloud.hasLaserAngles())
+    cout << "  Using input laser/ring metadata from the PLY stream." << endl;
+  else
+    cout << "  No laser/ring metadata found; falling back to clamped point index." << endl;
 
   // ---- 3. Set up minimal parameter sets ----
   SequenceParameterSet sps;
@@ -394,6 +397,12 @@ main(int argc, char* argv[])
   }
 
   PCCPointSet3 decCloud;
+  if (cloud.hasLaserAngles()) {
+    decCloud.addLaserAngles();
+    decCloud.resize(cloud.getPointCount());
+    for (size_t i = 0; i < cloud.getPointCount(); i++)
+      decCloud.setLaserAngle(i, cloud.getLaserAngle(i));
+  }
   PredGeomContexts decCtxtMem;
   std::unique_ptr<EntropyDecoder> aed(new EntropyDecoder());
   aed->setBuffer(codedGeomLen, payloadIn.data() + bytesReadHead);
