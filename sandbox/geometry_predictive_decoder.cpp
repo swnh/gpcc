@@ -39,6 +39,7 @@
 #include "hls.h"
 #include "quantization.h"
 
+#include <algorithm>
 #include <vector>
 
 namespace pcc {
@@ -48,10 +49,12 @@ namespace pcc {
 // Max ring groups for context array sizing (compile-time)
 static const int kMaxRingGroups = 32;
 static const int kNumRings = 32;
-static const int kHistSize = 7;
+static const int kHistSize = 4;
+static const int kHistTestCount = 3;
 static const int kCartesianRangeClasses = 3;
 static const int kCartesianBoundaryClasses = 2;
-static const int kCartesianPredModes = 6;
+static const int kCartesianPredModes = 9;
+static const int kCartesianPredFamilies = 3;
 
 namespace {
 
@@ -63,6 +66,9 @@ enum CartesianPredMode
   kPredCrossRingUp = 3,
   kPredCrossRingDown = 4,
   kPredFusedPrevPhi = 5,
+  kPredSameRingCubic3 = 6,
+  kPredCrossRingCorrected = 7,
+  kPredSameRingHist = 8,
 };
 
 inline int
@@ -84,9 +90,9 @@ computeRApprox(const point_t& pt)
 inline int
 computeRangeClass(int rApprox)
 {
-  if (rApprox < 1 << 10)
+  if (rApprox < 1 << 11)
     return 0;
-  if (rApprox < 1 << 12)
+  if (rApprox < 1 << 15)
     return 1;
   return 2;
 }
@@ -94,7 +100,25 @@ computeRangeClass(int rApprox)
 inline int
 boundaryThreshold()
 {
-  return 384;
+  return 2048;
+}
+
+inline int
+predFamily(int mode)
+{
+  switch (mode) {
+  case kPredSameRingLast:
+  case kPredSameRingLinear2:
+  case kPredSameRingCubic3:
+  case kPredSameRingHist:
+    return 0;
+  case kPredCrossRingUp:
+  case kPredCrossRingDown:
+  case kPredCrossRingCorrected:
+    return 1;
+  default:
+    return 2;
+  }
 }
 
 }  // namespace
@@ -134,6 +158,7 @@ public:
   //==================================================
   Vec3<int32_t> decodePredGeom(int group, int mode, int rangeClass, bool boundary);
   int decodeMode(int group, int rangeClass, bool boundary);
+  int decodeHistIdx(int group, int rangeClass, bool boundary);
   bool decodeEndOfTreesFlag();
   //==================================================
 
@@ -205,11 +230,13 @@ private:
   AdaptiveBitModel _ctxResGt0_g[kMaxRingGroups][kCartesianRangeClasses]
                               [kCartesianBoundaryClasses][kCartesianPredModes][3];
   AdaptiveBitModel _ctxSign_g[kMaxRingGroups][kCartesianRangeClasses]
-                             [kCartesianBoundaryClasses][3];
+                             [kCartesianBoundaryClasses][kCartesianPredFamilies][3];
   AdaptiveBitModel _ctxNumBits_g[kMaxRingGroups][kCartesianRangeClasses]
                                 [kCartesianBoundaryClasses][8][3][31];
   AdaptiveBitModel _ctxPredMode_g[kMaxRingGroups][kCartesianRangeClasses]
                                  [kCartesianBoundaryClasses][kCartesianPredModes];
+  AdaptiveBitModel _ctxHistIdx_g[kMaxRingGroups][kCartesianRangeClasses]
+                                [kCartesianBoundaryClasses][kHistSize - 1];
 };
 
 //============================================================================
@@ -823,13 +850,32 @@ PredGeomDecoder::decodeMode(int group, int rangeClass, bool boundary)
   return mode;
 }
 
+int
+PredGeomDecoder::decodeHistIdx(
+  int group, int rangeClass, bool boundary)
+{
+  const int g = group;
+  const int rc = std::max(0, std::min(kCartesianRangeClasses - 1, rangeClass));
+  const int bc = boundary ? 1 : 0;
+
+  int histIdx = 0;
+  while (
+    histIdx < kHistSize - 1
+    && _aed->decode(_ctxHistIdx_g[g][rc][bc][histIdx])) {
+    ++histIdx;
+  }
+  return histIdx;
+}
+
 Vec3<int32_t>
-PredGeomDecoder::decodePredGeom(int group, int mode, int rangeClass, bool boundary)
+PredGeomDecoder::decodePredGeom(
+  int group, int mode, int rangeClass, bool boundary)
 {
   const int g = group;
   const int rc = std::max(0, std::min(kCartesianRangeClasses - 1, rangeClass));
   const int bc = boundary ? 1 : 0;
   const int mc = std::max(0, std::min(kCartesianPredModes - 1, mode));
+  const int pf = predFamily(mc);
 
   Vec3<int32_t> residual;
   int k = 0;
@@ -852,17 +898,16 @@ PredGeomDecoder::decodePredGeom(int group, int mode, int rangeClass, bool bounda
 
     int32_t value = 0;
     int32_t numBitsExtra = numBits - 1;
-    for (int32_t i = 0; i < numBitsExtra; ++i) {
+    for (int32_t i = 0; i < numBitsExtra; ++i)
       value |= _aed->decode() << i;
-    }
-    if (numBits > 0) {
+    if (numBits > 0)
       value += (1 << numBitsExtra);
-    }
 
+    bool sign = _aed->decode(_ctxSign_g[g][rc][bc][pf][k]);
     int32_t res = value + 1;
-    bool sign = _aed->decode(_ctxSign_g[g][rc][bc][k]);
     residual[k] = sign ? -res : res;
   }
+
   return residual;
 }
 
@@ -911,25 +956,40 @@ void decodePredictiveGeometry(
   struct RingState {
     point_t last = 0;
     point_t prev = 0;
+    point_t prev2 = 0;
+    std::array<point_t, kHistSize> histPts = {};
     int lastR = 0;
     int prevR = 0;
+    int prev2R = 0;
+    std::array<int, kHistSize> histR = {};
     int count = 0;
 
     bool hasLast() const { return count >= 1; }
     bool hasPrev() const { return count >= 2; }
+    bool hasPrev2() const { return count >= 3; }
 
     void push(const point_t& pt, int rApprox)
     {
-      prev = last;
-      prevR = lastR;
-      last = pt;
-      lastR = rApprox;
-      count = std::min(count + 1, 2);
+      for (int i = kHistSize - 1; i > 0; --i) {
+        histPts[i] = histPts[i - 1];
+        histR[i] = histR[i - 1];
+      }
+      histPts[0] = pt;
+      histR[0] = rApprox;
+      count = std::min(count + 1, kHistSize);
+
+      last = histPts[0];
+      lastR = histR[0];
+      prev = count >= 2 ? histPts[1] : point_t(0);
+      prevR = count >= 2 ? histR[1] : 0;
+      prev2 = count >= 3 ? histPts[2] : point_t(0);
+      prev2R = count >= 3 ? histR[2] : 0;
     }
   };
 
   struct Candidate {
     point_t pred = 0;
+    int histIdx = 0;
     int predR = 0;
     int rangeClass = 0;
     bool boundary = false;
@@ -948,8 +1008,9 @@ void decodePredictiveGeometry(
     return -((-sum + (div >> 1)) / div);
   };
 
-  auto makeCandidate = [&](int laserIdx, int mode) {
+  auto makeCandidate = [&](int laserIdx, int mode, int histIdx) {
     Candidate cand;
+    cand.histIdx = histIdx;
 
     const auto& same = reconState[laserIdx];
     const auto* up = laserIdx > 0 ? &reconState[laserIdx - 1] : nullptr;
@@ -1029,6 +1090,38 @@ void decodePredictiveGeometry(
       break;
     }
 
+    case kPredSameRingCubic3:
+      if (same.hasPrev2()) {
+        cand.pred = same.last * 3 - same.prev * 3 + same.prev2;
+        cand.predR = computeRApprox(cand.pred);
+        cand.boundary =
+          std::abs(same.lastR - same.prevR) > boundaryThreshold()
+          || std::abs(same.prevR - same.prev2R) > boundaryThreshold();
+      }
+      break;
+
+    case kPredCrossRingCorrected:
+      if (same.hasPrev() && ((up && up->hasLast()) || (down && down->hasLast()))) {
+        const auto* adj = up && up->hasLast() ? up : down;
+        point_t delta = same.last - same.prev;
+        const int limit = std::max(boundaryThreshold() >> 1, same.lastR >> 3);
+        for (int k = 0; k < 3; k++)
+          delta[k] = std::max(-limit, std::min(limit, delta[k]));
+        cand.pred = adj->last + delta;
+        cand.predR = computeRApprox(cand.pred);
+        cand.boundary = std::abs(adj->lastR - same.lastR) > boundaryThreshold();
+      }
+      break;
+
+    case kPredSameRingHist:
+      if (same.count >= 2 && histIdx < std::min(same.count, kHistTestCount)) {
+        cand.pred = same.histPts[histIdx];
+        cand.predR = same.histR[histIdx];
+        cand.boundary = histIdx + 1 < same.count
+          && std::abs(same.histR[histIdx] - same.histR[histIdx + 1]) > boundaryThreshold();
+      }
+      break;
+
     default:
       break;
     }
@@ -1052,7 +1145,12 @@ void decodePredictiveGeometry(
     const int ctxGroup = ctxGroupForLaser(laserIdx);
     const int mode =
       dec.decodeMode(ctxGroup, headerCand.rangeClass, headerCand.boundary);
-    const Candidate cand = makeCandidate(laserIdx, mode);
+    int histIdx = 0;
+    if (mode == kPredSameRingHist)
+      histIdx = std::min(kHistTestCount - 1,
+        dec.decodeHistIdx(ctxGroup, headerCand.rangeClass, headerCand.boundary));
+
+    const Candidate cand = makeCandidate(laserIdx, mode, histIdx);
     Vec3<int32_t> residual =
       dec.decodePredGeom(ctxGroup, mode, cand.rangeClass, cand.boundary);
     point_t reconPoint = cand.pred + residual;
