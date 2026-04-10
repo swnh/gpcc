@@ -36,6 +36,7 @@
 
 #include "geometry_predictive.h"
 #include "geometry.h"
+#include "flat_predgeom_common.h"
 #include "hls.h"
 #include "quantization.h"
 
@@ -48,80 +49,7 @@ namespace pcc {
 
 // Max ring groups for context array sizing (compile-time)
 static const int kMaxRingGroups = 32;
-static const int kNumRings = 32;
-static const int kHistSize = 4;
-static const int kHistTestCount = 3;
-static const int kCartesianRangeClasses = 3;
-static const int kCartesianBoundaryClasses = 2;
-static const int kCartesianPredModes = 9;
-static const int kCartesianPredFamilies = 3;
-
-namespace {
-
-enum CartesianPredMode
-{
-  kPredZero = 0,
-  kPredSameRingLast = 1,
-  kPredSameRingLinear2 = 2,
-  kPredCrossRingUp = 3,
-  kPredCrossRingDown = 4,
-  kPredFusedPrevPhi = 5,
-  kPredSameRingCubic3 = 6,
-  kPredCrossRingCorrected = 7,
-  kPredSameRingHist = 8,
-};
-
-inline int
-clampLaserIdx(const PCCPointSet3& cloud, int idx)
-{
-  if (!cloud.hasLaserAngles())
-    return std::max(0, std::min(kNumRings - 1, idx));
-  return std::max(0, std::min(kNumRings - 1, cloud.getLaserAngle(idx)));
-}
-
-inline int
-computeRApprox(const point_t& pt)
-{
-  auto absX = std::abs(pt[0]);
-  auto absY = std::abs(pt[1]);
-  return std::max(absX, absY) + ((424 * std::min(absX, absY)) >> 10);
-}
-
-inline int
-computeRangeClass(int rApprox)
-{
-  if (rApprox < 1 << 11)
-    return 0;
-  if (rApprox < 1 << 15)
-    return 1;
-  return 2;
-}
-
-inline int
-boundaryThreshold()
-{
-  return 2048;
-}
-
-inline int
-predFamily(int mode)
-{
-  switch (mode) {
-  case kPredSameRingLast:
-  case kPredSameRingLinear2:
-  case kPredSameRingCubic3:
-  case kPredSameRingHist:
-    return 0;
-  case kPredCrossRingUp:
-  case kPredCrossRingDown:
-  case kPredCrossRingCorrected:
-    return 1;
-  default:
-    return 2;
-  }
-}
-
-}  // namespace
+namespace fp = flat_predgeom;
 
 class PredGeomDecoder : protected PredGeomContexts {
 public:
@@ -157,8 +85,7 @@ public:
 
   //==================================================
   Vec3<int32_t> decodePredGeom(int group, int mode, int rangeClass, bool boundary);
-  int decodeMode(int group, int rangeClass, bool boundary);
-  int decodeHistIdx(int group, int rangeClass, bool boundary);
+  int decodeModeHeader(int group, int rangeClass, bool boundary);
   bool decodeEndOfTreesFlag();
   //==================================================
 
@@ -227,16 +154,18 @@ private:
 
   // ---- Per-ring-group context arrays (used by decodePredGeom) ----
   int _numRingGroups;
-  AdaptiveBitModel _ctxResGt0_g[kMaxRingGroups][kCartesianRangeClasses]
-                              [kCartesianBoundaryClasses][kCartesianPredModes][3];
-  AdaptiveBitModel _ctxSign_g[kMaxRingGroups][kCartesianRangeClasses]
-                             [kCartesianBoundaryClasses][kCartesianPredFamilies][3];
-  AdaptiveBitModel _ctxNumBits_g[kMaxRingGroups][kCartesianRangeClasses]
-                                [kCartesianBoundaryClasses][8][3][31];
-  AdaptiveBitModel _ctxPredMode_g[kMaxRingGroups][kCartesianRangeClasses]
-                                 [kCartesianBoundaryClasses][kCartesianPredModes];
-  AdaptiveBitModel _ctxHistIdx_g[kMaxRingGroups][kCartesianRangeClasses]
-                                [kCartesianBoundaryClasses][kHistSize - 1];
+  AdaptiveBitModel _ctxResGt0_g[kMaxRingGroups][fp::kCartesianRangeClasses]
+                              [fp::kCartesianBoundaryClasses][fp::kCartesianPredFamilies][3];
+  AdaptiveBitModel _ctxSign_g[kMaxRingGroups][fp::kCartesianRangeClasses]
+                             [fp::kCartesianBoundaryClasses][fp::kCartesianPredFamilies][3];
+  AdaptiveBitModel _ctxNumBits_g[kMaxRingGroups][fp::kCartesianRangeClasses]
+                                [fp::kCartesianBoundaryClasses][8][3][31];
+  AdaptiveBitModel _ctxModeFamily_g[kMaxRingGroups][fp::kCartesianRangeClasses]
+                                   [fp::kCartesianBoundaryClasses];
+  AdaptiveBitModel _ctxModeGroupBit1_g[kMaxRingGroups][fp::kCartesianRangeClasses]
+                                      [fp::kCartesianBoundaryClasses][fp::kCartesianPredFamilies];
+  AdaptiveBitModel _ctxModeGroupBit0_g[kMaxRingGroups][fp::kCartesianRangeClasses]
+                                      [fp::kCartesianBoundaryClasses][fp::kCartesianPredFamilies][2];
 };
 
 //============================================================================
@@ -835,36 +764,16 @@ PredGeomDecoder::decode(
 // ============================================================================
 
 int
-PredGeomDecoder::decodeMode(int group, int rangeClass, bool boundary)
+PredGeomDecoder::decodeModeHeader(int group, int rangeClass, bool boundary)
 {
   const int g = group;
-  const int rc = std::max(0, std::min(kCartesianRangeClasses - 1, rangeClass));
+  const int rc = std::max(0, std::min(fp::kCartesianRangeClasses - 1, rangeClass));
   const int bc = boundary ? 1 : 0;
-
-  int mode = 0;
-  while (
-    mode < kCartesianPredModes - 1
-    && _aed->decode(_ctxPredMode_g[g][rc][bc][mode])) {
-    ++mode;
-  }
-  return mode;
-}
-
-int
-PredGeomDecoder::decodeHistIdx(
-  int group, int rangeClass, bool boundary)
-{
-  const int g = group;
-  const int rc = std::max(0, std::min(kCartesianRangeClasses - 1, rangeClass));
-  const int bc = boundary ? 1 : 0;
-
-  int histIdx = 0;
-  while (
-    histIdx < kHistSize - 1
-    && _aed->decode(_ctxHistIdx_g[g][rc][bc][histIdx])) {
-    ++histIdx;
-  }
-  return histIdx;
+  const int familyBit = _aed->decode(_ctxModeFamily_g[g][rc][bc]);
+  const int groupBit1 = _aed->decode(_ctxModeGroupBit1_g[g][rc][bc][familyBit]);
+  const int groupBit0 =
+    _aed->decode(_ctxModeGroupBit0_g[g][rc][bc][familyBit][groupBit1]);
+  return fp::bitsToMode(familyBit, (groupBit1 << 1) | groupBit0);
 }
 
 Vec3<int32_t>
@@ -872,15 +781,15 @@ PredGeomDecoder::decodePredGeom(
   int group, int mode, int rangeClass, bool boundary)
 {
   const int g = group;
-  const int rc = std::max(0, std::min(kCartesianRangeClasses - 1, rangeClass));
+  const int rc = std::max(0, std::min(fp::kCartesianRangeClasses - 1, rangeClass));
   const int bc = boundary ? 1 : 0;
-  const int mc = std::max(0, std::min(kCartesianPredModes - 1, mode));
-  const int pf = predFamily(mc);
+  const int mc = std::max(0, std::min(fp::kCartesianPredModes - 1, mode));
+  const int pf = fp::predFamily(mc);
 
   Vec3<int32_t> residual;
   int k = 0;
   for (int ctxIdx = 0; k < 3; k++) {
-    if (!_aed->decode(_ctxResGt0_g[g][rc][bc][mc][k])) {
+    if (!_aed->decode(_ctxResGt0_g[g][rc][bc][pf][k])) {
       residual[k] = 0;
       continue;
     }
@@ -953,213 +862,29 @@ void decodePredictiveGeometry(
 
   PredGeomDecoder dec(gps, gbh, ctxtMem, arithmeticDecoder, numGroups);
 
-  struct RingState {
-    point_t last = 0;
-    point_t prev = 0;
-    point_t prev2 = 0;
-    std::array<point_t, kHistSize> histPts = {};
-    int lastR = 0;
-    int prevR = 0;
-    int prev2R = 0;
-    std::array<int, kHistSize> histR = {};
-    int count = 0;
-
-    bool hasLast() const { return count >= 1; }
-    bool hasPrev() const { return count >= 2; }
-    bool hasPrev2() const { return count >= 3; }
-
-    void push(const point_t& pt, int rApprox)
-    {
-      for (int i = kHistSize - 1; i > 0; --i) {
-        histPts[i] = histPts[i - 1];
-        histR[i] = histR[i - 1];
-      }
-      histPts[0] = pt;
-      histR[0] = rApprox;
-      count = std::min(count + 1, kHistSize);
-
-      last = histPts[0];
-      lastR = histR[0];
-      prev = count >= 2 ? histPts[1] : point_t(0);
-      prevR = count >= 2 ? histR[1] : 0;
-      prev2 = count >= 3 ? histPts[2] : point_t(0);
-      prev2R = count >= 3 ? histR[2] : 0;
-    }
-  };
-
-  struct Candidate {
-    point_t pred = 0;
-    int histIdx = 0;
-    int predR = 0;
-    int rangeClass = 0;
-    bool boundary = false;
-  };
-
-  std::array<RingState, kNumRings> reconState = {};
-
-  auto ctxGroupForLaser = [numGroups](int laserIdx) {
-    const int ringsPerGroup = std::max(1, kNumRings / numGroups);
-    return std::min(numGroups - 1, std::max(0, laserIdx / ringsPerGroup));
-  };
-
-  auto roundedDiv = [](int sum, int div) {
-    if (sum >= 0)
-      return (sum + (div >> 1)) / div;
-    return -((-sum + (div >> 1)) / div);
-  };
-
-  auto makeCandidate = [&](int laserIdx, int mode, int histIdx) {
-    Candidate cand;
-    cand.histIdx = histIdx;
-
-    const auto& same = reconState[laserIdx];
-    const auto* up = laserIdx > 0 ? &reconState[laserIdx - 1] : nullptr;
-    const auto* down = laserIdx + 1 < kNumRings ? &reconState[laserIdx + 1] : nullptr;
-
-    switch (mode) {
-    case kPredZero:
-      cand.pred = 0;
-      cand.predR = 0;
-      cand.boundary = false;
-      break;
-
-    case kPredSameRingLast:
-      if (same.hasLast()) {
-        cand.pred = same.last;
-        cand.predR = same.lastR;
-        cand.boundary = same.hasPrev()
-          && std::abs(same.lastR - same.prevR) > boundaryThreshold();
-      }
-      break;
-
-    case kPredSameRingLinear2:
-      if (same.hasPrev()) {
-        cand.pred = same.last * 2 - same.prev;
-        cand.predR = computeRApprox(cand.pred);
-        cand.boundary = std::abs(same.lastR - same.prevR) > boundaryThreshold();
-      }
-      break;
-
-    case kPredCrossRingUp:
-      if (up && up->hasLast()) {
-        cand.pred = up->last;
-        cand.predR = up->lastR;
-        cand.boundary = same.hasLast()
-          && std::abs(up->lastR - same.lastR) > boundaryThreshold();
-      }
-      break;
-
-    case kPredCrossRingDown:
-      if (down && down->hasLast()) {
-        cand.pred = down->last;
-        cand.predR = down->lastR;
-        cand.boundary = same.hasLast()
-          && std::abs(down->lastR - same.lastR) > boundaryThreshold();
-      }
-      break;
-
-    case kPredFusedPrevPhi: {
-      int sum[3] = {};
-      int count = 0;
-      bool boundary = false;
-      if (same.hasLast()) {
-        for (int k = 0; k < 3; k++)
-          sum[k] += same.last[k];
-        count++;
-      }
-      if (up && up->hasLast()) {
-        for (int k = 0; k < 3; k++)
-          sum[k] += up->last[k];
-        count++;
-        boundary |= same.hasLast()
-          && std::abs(up->lastR - same.lastR) > boundaryThreshold();
-      }
-      if (down && down->hasLast()) {
-        for (int k = 0; k < 3; k++)
-          sum[k] += down->last[k];
-        count++;
-        boundary |= same.hasLast()
-          && std::abs(down->lastR - same.lastR) > boundaryThreshold();
-      }
-      if (count >= 2) {
-        for (int k = 0; k < 3; k++)
-          cand.pred[k] = roundedDiv(sum[k], count);
-        cand.predR = computeRApprox(cand.pred);
-        cand.boundary = boundary;
-      }
-      break;
-    }
-
-    case kPredSameRingCubic3:
-      if (same.hasPrev2()) {
-        cand.pred = same.last * 3 - same.prev * 3 + same.prev2;
-        cand.predR = computeRApprox(cand.pred);
-        cand.boundary =
-          std::abs(same.lastR - same.prevR) > boundaryThreshold()
-          || std::abs(same.prevR - same.prev2R) > boundaryThreshold();
-      }
-      break;
-
-    case kPredCrossRingCorrected:
-      if (same.hasPrev() && ((up && up->hasLast()) || (down && down->hasLast()))) {
-        const auto* adj = up && up->hasLast() ? up : down;
-        point_t delta = same.last - same.prev;
-        const int limit = std::max(boundaryThreshold() >> 1, same.lastR >> 3);
-        for (int k = 0; k < 3; k++)
-          delta[k] = std::max(-limit, std::min(limit, delta[k]));
-        cand.pred = adj->last + delta;
-        cand.predR = computeRApprox(cand.pred);
-        cand.boundary = std::abs(adj->lastR - same.lastR) > boundaryThreshold();
-      }
-      break;
-
-    case kPredSameRingHist:
-      if (same.count >= 2 && histIdx < std::min(same.count, kHistTestCount)) {
-        cand.pred = same.histPts[histIdx];
-        cand.predR = same.histR[histIdx];
-        cand.boundary = histIdx + 1 < same.count
-          && std::abs(same.histR[histIdx] - same.histR[histIdx + 1]) > boundaryThreshold();
-      }
-      break;
-
-    default:
-      break;
-    }
-
-    cand.rangeClass = computeRangeClass(cand.predR);
-    return cand;
-  };
+  std::array<fp::RingState, fp::kNumRings> reconState = {};
 
   for (int p = 0; p < numPoints; p++) {
-    const int laserIdx = clampLaserIdx(cloud, p);
+    const int laserIdx = fp::clampLaserIdx(cloud, p);
 
-    Candidate headerCand;
-    if (reconState[laserIdx].hasLast()) {
-      headerCand.predR = reconState[laserIdx].lastR;
-      headerCand.rangeClass = computeRangeClass(headerCand.predR);
-      headerCand.boundary = reconState[laserIdx].hasPrev()
-        && std::abs(reconState[laserIdx].lastR - reconState[laserIdx].prevR)
-             > boundaryThreshold();
-    }
+    const fp::ModeContextKey modeCtx = fp::deriveModeContext(reconState[laserIdx]);
+    const int ctxGroup = fp::ctxGroupForLaser(numGroups, laserIdx);
+    const int mode = dec.decodeModeHeader(
+      ctxGroup, modeCtx.rangeClass, modeCtx.boundary);
 
-    const int ctxGroup = ctxGroupForLaser(laserIdx);
-    const int mode =
-      dec.decodeMode(ctxGroup, headerCand.rangeClass, headerCand.boundary);
-    int histIdx = 0;
-    if (mode == kPredSameRingHist)
-      histIdx = std::min(kHistTestCount - 1,
-        dec.decodeHistIdx(ctxGroup, headerCand.rangeClass, headerCand.boundary));
+    const fp::Candidate cand = fp::makeCandidate(reconState, laserIdx, mode);
+    if (!cand.valid)
+      throw std::runtime_error("flat predgeom: decoded invalid mode candidate");
 
-    const Candidate cand = makeCandidate(laserIdx, mode, histIdx);
-    Vec3<int32_t> residual =
-      dec.decodePredGeom(ctxGroup, mode, cand.rangeClass, cand.boundary);
+    const fp::ResidualContextKey residualCtx = fp::deriveResidualContext(cand);
+    Vec3<int32_t> residual = dec.decodePredGeom(
+      ctxGroup, mode, residualCtx.rangeClass, residualCtx.boundary);
     point_t reconPoint = cand.pred + residual;
 
-    reconState[laserIdx].push(reconPoint, computeRApprox(reconPoint));
+    reconState[laserIdx].push(reconPoint, fp::computeRApprox(reconPoint));
     cloud[p] = reconPoint;
   }
 
-  // Consume tree terminator flags until the final true is encountered.
   while (!dec.decodeEndOfTreesFlag()) {
   }
 
