@@ -44,6 +44,7 @@ struct SimpleParams {
   string outputBitstreamPath = "predgeom.bin";  // --output
   string reconstructedPath = "recon.ply";       // --recon
   string decodedPath = "decoded.ply";           // --decoded
+  string dumpCsvPath;                           // --dump-csv
   double inputScale = 1.0;                      // --scale
   int    numGroups  = 1;                        // --groups
 };
@@ -60,7 +61,8 @@ void encodePredictiveGeometry(
   PCCPointSet3& cloud,
   PredGeomContexts& ctxtMem,
   EntropyEncoder* arithmeticEncoder,
-  int numGroups);
+  int numGroups,
+  const std::string& dumpCsvPath);
 
 void decodePredictiveGeometry(
   const GeometryParameterSet& gps,
@@ -79,7 +81,8 @@ parseSimpleArgs(int argc, char* argv[], SimpleParams& p)
     cerr << "Usage: " << argv[0]
          << " --input <ply> [--output <bitstream.bin>] [--recon <recon.ply>]"
          << " [--decoded <decoded.ply>]"
-         << " [--scale <inputScale>] [--groups <1|2|4|8|16|32>]\n";
+         << " [--scale <inputScale>] [--groups <1|2|4|8|16|32>]"
+         << " [--dump-csv <context.csv>]\n";
     return false;
   }
   for (int i = 1; i < argc; i++) {
@@ -96,6 +99,8 @@ parseSimpleArgs(int argc, char* argv[], SimpleParams& p)
       p.inputScale = atof(argv[++i]);
     else if ((arg == "--groups" || arg == "-g") && i + 1 < argc)
       p.numGroups = atoi(argv[++i]);
+    else if (arg == "--dump-csv" && i + 1 < argc)
+      p.dumpCsvPath = argv[++i];
     else {
       cerr << "Unknown option: " << arg << "\n";
       return false;
@@ -324,6 +329,8 @@ main(int argc, char* argv[])
 
   cout << "\n[2] Encoding (PredictiveGeometry, flat ring-based loop, "
        << params.numGroups << " context group(s)) ..." << endl;
+  if (!params.dumpCsvPath.empty())
+    cout << "  Dumping per-point context CSV to: " << params.dumpCsvPath << endl;
 
   // Start payload buffer
   PayloadBuffer payload(PayloadType::kGeometryBrick);
@@ -341,7 +348,7 @@ main(int argc, char* argv[])
 
   encodePredictiveGeometry(
     predGeomOpt, gps, gbh, cloud,
-    ctxtMem, aec.get(), params.numGroups);
+    ctxtMem, aec.get(), params.numGroups, params.dumpCsvPath);
 
   clock_user.stop();
   clock_wall.stop();

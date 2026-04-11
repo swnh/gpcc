@@ -44,8 +44,10 @@
 #include "nanoflann.hpp"
 #include <algorithm>
 #include <bitset>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <string>
 
 namespace pcc {
 
@@ -94,6 +96,63 @@ namespace {
         0, std::min(flat_predgeom::kCartesianRangeClasses - 1, rangeClass)),
       boundary ? 1 : 0};
   }
+
+  class FlatPredGeomDumpWriter {
+  public:
+    explicit FlatPredGeomDumpWriter(const std::string& csvPath)
+    {
+      if (csvPath.empty())
+        return;
+      _stream.open(csvPath, std::ios::out | std::ios::trunc);
+      if (!_stream.is_open())
+        throw std::runtime_error("flat predgeom: failed to open dump CSV: " + csvPath);
+      _enabled = true;
+      _stream
+        << "coded_idx,src_idx,laser_idx,ctx_group,mode_range_class,mode_boundary,"
+        << "res_range_class,res_boundary,mode,mode_family,mode_group_bits,"
+        << "pred_x,pred_y,pred_z,curr_x,curr_y,curr_z,res_x,res_y,res_z,res_l1,"
+        << "recon_x,recon_y,recon_z,pred_r,recon_r\n";
+    }
+
+    void writeRow(
+      int codedIdx,
+      int srcIdx,
+      int laserIdx,
+      int ctxGroup,
+      int modeRangeClass,
+      bool modeBoundary,
+      int resRangeClass,
+      bool resBoundary,
+      int mode,
+      const flat_predgeom::ModeBits& modeBits,
+      const point_t& pred,
+      const point_t& curr,
+      const point_t& residual,
+      int64_t residualL1,
+      const point_t& reconPoint,
+      int predR,
+      int reconR)
+    {
+      if (!_enabled)
+        return;
+
+      _stream
+        << codedIdx << ',' << srcIdx << ',' << laserIdx << ','
+        << ctxGroup << ',' << modeRangeClass << ',' << (modeBoundary ? 1 : 0) << ','
+        << resRangeClass << ',' << (resBoundary ? 1 : 0) << ','
+        << mode << ',' << modeBits.familyBit << ',' << modeBits.groupBits << ','
+        << pred[0] << ',' << pred[1] << ',' << pred[2] << ','
+        << curr[0] << ',' << curr[1] << ',' << curr[2] << ','
+        << residual[0] << ',' << residual[1] << ',' << residual[2] << ','
+        << residualL1 << ','
+        << reconPoint[0] << ',' << reconPoint[1] << ',' << reconPoint[2] << ','
+        << predR << ',' << reconR << '\n';
+    }
+
+  private:
+    bool _enabled = false;
+    std::ofstream _stream;
+  };
 }  // namespace
 
 //============================================================================
@@ -1731,9 +1790,11 @@ encodePredictiveGeometry(
   PCCPointSet3& cloud,
   PredGeomContexts& ctxtMem,
   EntropyEncoder* arithmeticEncoder,
-  int numGroups)
+  int numGroups,
+  const std::string& dumpCsvPath)
 {
   auto numPoints = cloud.getPointCount();
+  FlatPredGeomDumpWriter dumpWriter(dumpCsvPath);
 
   PCCPointSet3 outCloud;
   outCloud.addRemoveAttributes(cloud.hasColors(), cloud.hasReflectances());
@@ -1793,7 +1854,8 @@ encodePredictiveGeometry(
       residualCtx.boundary);
 
     const point_t reconPoint = best.pred + bestResidual;
-    reconState[laserIdx].push(reconPoint, fp::computeRApprox(reconPoint));
+    const int reconR = fp::computeRApprox(reconPoint);
+    reconState[laserIdx].push(reconPoint, reconR);
 
     const auto modeBits = fp::modeToBits(best.mode);
     modeHist[best.mode]++;
@@ -1808,6 +1870,11 @@ encodePredictiveGeometry(
     for (int k = 0; k < 3; k++)
       zeroHist[k] += bestResidual[k] == 0;
     totalL1 += bestL1;
+
+    dumpWriter.writeRow(
+      codedIdx, p, laserIdx, ctxGroup, modeCtx.rangeClass, modeCtx.boundary,
+      residualCtx.rangeClass, residualCtx.boundary, best.mode, modeBits, best.pred, curr,
+      bestResidual, bestL1, reconPoint, best.predR, reconR);
 
     codedOrder[codedIdx] = p;
     codedIdx++;
