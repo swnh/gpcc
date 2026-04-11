@@ -47,6 +47,25 @@ namespace pcc {
 
 //============================================================================
 
+namespace {
+  // Canonicalized address used by flat cartesian mode/residual contexts.
+  struct FlatCtxAddr {
+    int ringGroup;
+    int rangeClass;
+    int boundaryClass;
+  };
+
+  inline FlatCtxAddr
+  makeFlatCtxAddr(int group, int rangeClass, bool boundary)
+  {
+    return {
+      group,
+      std::max(
+        0, std::min(flat_predgeom::kCartesianRangeClasses - 1, rangeClass)),
+      boundary ? 1 : 0};
+  }
+}  // namespace
+
 // Max ring groups for context array sizing (compile-time)
 static const int kMaxRingGroups = 32;
 namespace fp = flat_predgeom;
@@ -766,13 +785,14 @@ PredGeomDecoder::decode(
 int
 PredGeomDecoder::decodeModeHeader(int group, int rangeClass, bool boundary)
 {
-  const int g = group;
-  const int rc = std::max(0, std::min(fp::kCartesianRangeClasses - 1, rangeClass));
-  const int bc = boundary ? 1 : 0;
-  const int familyBit = _aed->decode(_ctxModeFamily_g[g][rc][bc]);
-  const int groupBit1 = _aed->decode(_ctxModeGroupBit1_g[g][rc][bc][familyBit]);
+  const auto ctx = makeFlatCtxAddr(group, rangeClass, boundary);
+  const int familyBit =
+    _aed->decode(_ctxModeFamily_g[ctx.ringGroup][ctx.rangeClass][ctx.boundaryClass]);
+  const int groupBit1 = _aed->decode(
+    _ctxModeGroupBit1_g[ctx.ringGroup][ctx.rangeClass][ctx.boundaryClass][familyBit]);
   const int groupBit0 =
-    _aed->decode(_ctxModeGroupBit0_g[g][rc][bc][familyBit][groupBit1]);
+    _aed->decode(_ctxModeGroupBit0_g[ctx.ringGroup][ctx.rangeClass][ctx.boundaryClass]
+                                  [familyBit][groupBit1]);
   return fp::bitsToMode(familyBit, (groupBit1 << 1) | groupBit0);
 }
 
@@ -780,30 +800,31 @@ Vec3<int32_t>
 PredGeomDecoder::decodePredGeom(
   int group, int mode, int rangeClass, bool boundary)
 {
-  const int g = group;
-  const int rc = std::max(0, std::min(fp::kCartesianRangeClasses - 1, rangeClass));
-  const int bc = boundary ? 1 : 0;
+  const auto ctx = makeFlatCtxAddr(group, rangeClass, boundary);
   const int mc = std::max(0, std::min(fp::kCartesianPredModes - 1, mode));
   const int pf = fp::predFamily(mc);
 
   Vec3<int32_t> residual;
-  int k = 0;
-  for (int ctxIdx = 0; k < 3; k++) {
-    if (!_aed->decode(_ctxResGt0_g[g][rc][bc][pf][k])) {
-      residual[k] = 0;
+  int magnitudeCtx = 0;
+  for (int axis = 0; axis < 3; axis++) {
+    if (!_aed->decode(
+          _ctxResGt0_g[ctx.ringGroup][ctx.rangeClass][ctx.boundaryClass][pf][axis])) {
+      residual[axis] = 0;
       continue;
     }
 
     int32_t numBits = 0;
-    AdaptiveBitModel* ctxs = &_ctxNumBits_g[g][rc][bc][ctxIdx][k][0] - 1;
-    int ctx = 1;
-    for (int n = _pgeom_resid_abs_log2_bits[k] - 1; n >= 0; n--) {
-      auto bin = _aed->decode(ctxs[ctx]);
+    AdaptiveBitModel* bitlenTree =
+      &_ctxNumBits_g[ctx.ringGroup][ctx.rangeClass][ctx.boundaryClass][magnitudeCtx][axis][0]
+      - 1;
+    int bitlenNode = 1;
+    for (int n = _pgeom_resid_abs_log2_bits[axis] - 1; n >= 0; n--) {
+      auto bin = _aed->decode(bitlenTree[bitlenNode]);
       numBits = (numBits << 1) | bin;
-      ctx = (ctx << 1) | bin;
+      bitlenNode = (bitlenNode << 1) | bin;
     }
 
-    ctxIdx = std::min(7, (numBits + 1) >> 1);
+    magnitudeCtx = std::min(7, (numBits + 1) >> 1);
 
     int32_t value = 0;
     int32_t numBitsExtra = numBits - 1;
@@ -812,9 +833,10 @@ PredGeomDecoder::decodePredGeom(
     if (numBits > 0)
       value += (1 << numBitsExtra);
 
-    bool sign = _aed->decode(_ctxSign_g[g][rc][bc][pf][k]);
+    bool sign = _aed->decode(
+      _ctxSign_g[ctx.ringGroup][ctx.rangeClass][ctx.boundaryClass][pf][axis]);
     int32_t res = value + 1;
-    residual[k] = sign ? -res : res;
+    residual[axis] = sign ? -res : res;
   }
 
   return residual;

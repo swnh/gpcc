@@ -77,6 +77,23 @@ namespace {
   {
     return -log2(dirac::approxSymbolProbability(bit, model) / 128.);
   }
+
+  // Canonicalized address used by flat cartesian mode/residual contexts.
+  struct FlatCtxAddr {
+    int ringGroup;
+    int rangeClass;
+    int boundaryClass;
+  };
+
+  inline FlatCtxAddr
+  makeFlatCtxAddr(int group, int rangeClass, bool boundary)
+  {
+    return {
+      group,
+      std::max(
+        0, std::min(flat_predgeom::kCartesianRangeClasses - 1, rangeClass)),
+      boundary ? 1 : 0};
+  }
 }  // namespace
 
 //============================================================================
@@ -135,13 +152,6 @@ public:
     int rangeClass,
     bool boundary);
   void encodeModeHeader(int mode, int group, int rangeClass, bool boundary);
-  float estimateModeHeaderBits(int mode, int group, int rangeClass, bool boundary);
-  float estimatePredGeomBits(
-    const Vec3<int32_t>& residual,
-    int group,
-    int mode,
-    int rangeClass,
-    bool boundary);
   //==================================================
 
   void encodeResidual(const Vec3<int32_t>& residual, int iMode, int multiplier, int rPred, int predIdx, const bool interFlag
@@ -1650,36 +1660,19 @@ encodePredictiveGeometry(
 void
 PredGeomEncoder::encodeModeHeader(int mode, int group, int rangeClass, bool boundary)
 {
-  const int g = group;
-  const int rc = std::max(0, std::min(fp::kCartesianRangeClasses - 1, rangeClass));
-  const int bc = boundary ? 1 : 0;
+  const auto ctx = makeFlatCtxAddr(group, rangeClass, boundary);
   const auto bits = fp::modeToBits(mode);
   const int groupBit1 = (bits.groupBits >> 1) & 1;
   const int groupBit0 = bits.groupBits & 1;
 
-  _aec->encode(bits.familyBit, _ctxModeFamily_g[g][rc][bc]);
-  _aec->encode(groupBit1, _ctxModeGroupBit1_g[g][rc][bc][bits.familyBit]);
-  _aec->encode(groupBit0, _ctxModeGroupBit0_g[g][rc][bc][bits.familyBit][groupBit1]);
-}
-
-float
-PredGeomEncoder::estimateModeHeaderBits(
-  int mode, int group, int rangeClass, bool boundary)
-{
-  const int g = group;
-  const int rc = std::max(0, std::min(fp::kCartesianRangeClasses - 1, rangeClass));
-  const int bc = boundary ? 1 : 0;
-  const auto bits = fp::modeToBits(mode);
-  const int groupBit1 = (bits.groupBits >> 1) & 1;
-  const int groupBit0 = bits.groupBits & 1;
-
-  float headerBits = 0.F;
-  headerBits += estimate(bits.familyBit, _ctxModeFamily_g[g][rc][bc]);
-  headerBits += estimate(
-    groupBit1, _ctxModeGroupBit1_g[g][rc][bc][bits.familyBit]);
-  headerBits += estimate(
-    groupBit0, _ctxModeGroupBit0_g[g][rc][bc][bits.familyBit][groupBit1]);
-  return headerBits;
+  _aec->encode(bits.familyBit, _ctxModeFamily_g[ctx.ringGroup][ctx.rangeClass][ctx.boundaryClass]);
+  _aec->encode(
+    groupBit1,
+    _ctxModeGroupBit1_g[ctx.ringGroup][ctx.rangeClass][ctx.boundaryClass][bits.familyBit]);
+  _aec->encode(
+    groupBit0,
+    _ctxModeGroupBit0_g[ctx.ringGroup][ctx.rangeClass][ctx.boundaryClass][bits.familyBit]
+                         [groupBit1]);
 }
 
 void
@@ -1690,77 +1683,42 @@ PredGeomEncoder::encodePredGeom(
   int rangeClass,
   bool boundary)
 {
-  const int g = group;
-  const int rc = std::max(0, std::min(fp::kCartesianRangeClasses - 1, rangeClass));
-  const int bc = boundary ? 1 : 0;
+  const auto ctx = makeFlatCtxAddr(group, rangeClass, boundary);
   const int mc = std::max(0, std::min(fp::kCartesianPredModes - 1, mode));
   const int pf = fp::predFamily(mc);
 
-  int k = 0;
-  for (int ctxIdx = 0; k < 3; k++) {
-    const auto res = residual[k];
-    _aec->encode(res != 0, _ctxResGt0_g[g][rc][bc][pf][k]);
+  int magnitudeCtx = 0;
+  for (int axis = 0; axis < 3; axis++) {
+    const auto res = residual[axis];
+    _aec->encode(
+      res != 0,
+      _ctxResGt0_g[ctx.ringGroup][ctx.rangeClass][ctx.boundaryClass][pf][axis]);
     if (!res)
       continue;
 
     int32_t value = abs(res) - 1;
     int32_t numBits = 1 + ilog2(uint32_t(value));
 
-    AdaptiveBitModel* ctxs = &_ctxNumBits_g[g][rc][bc][ctxIdx][k][0] - 1;
-    for (int ctxIdx = 1, n = _pgeom_resid_abs_log2_bits[k] - 1; n >= 0; n--) {
+    AdaptiveBitModel* bitlenTree =
+      &_ctxNumBits_g[ctx.ringGroup][ctx.rangeClass][ctx.boundaryClass][magnitudeCtx][axis][0]
+      - 1;
+    int bitlenNode = 1;
+    for (int n = _pgeom_resid_abs_log2_bits[axis] - 1; n >= 0; n--) {
       auto bin = (numBits >> n) & 1;
-      _aec->encode(bin, ctxs[ctxIdx]);
-      ctxIdx = (ctxIdx << 1) | bin;
+      _aec->encode(bin, bitlenTree[bitlenNode]);
+      bitlenNode = (bitlenNode << 1) | bin;
     }
 
-    ctxIdx = std::min(7, (numBits + 1) >> 1);
+    magnitudeCtx = std::min(7, (numBits + 1) >> 1);
 
     --numBits;
     for (int32_t i = 0; i < numBits; ++i)
       _aec->encode((value >> i) & 1);
 
-    _aec->encode(res < 0, _ctxSign_g[g][rc][bc][pf][k]);
+    _aec->encode(
+      res < 0,
+      _ctxSign_g[ctx.ringGroup][ctx.rangeClass][ctx.boundaryClass][pf][axis]);
   }
-}
-
-float
-PredGeomEncoder::estimatePredGeomBits(
-  const Vec3<int32_t>& residual,
-  int group,
-  int mode,
-  int rangeClass,
-  bool boundary)
-{
-  const int g = group;
-  const int rc = std::max(0, std::min(fp::kCartesianRangeClasses - 1, rangeClass));
-  const int bc = boundary ? 1 : 0;
-  const int mc = std::max(0, std::min(fp::kCartesianPredModes - 1, mode));
-  const int pf = fp::predFamily(mc);
-
-  float bits = 0.F;
-  int k = 0;
-  for (int ctxIdx = 0; k < 3; k++) {
-    const auto res = residual[k];
-    bits += estimate(res != 0, _ctxResGt0_g[g][rc][bc][pf][k]);
-    if (!res)
-      continue;
-
-    int32_t value = abs(res) - 1;
-    int32_t numBits = 1 + ilog2(uint32_t(value));
-
-    AdaptiveBitModel* ctxs = &_ctxNumBits_g[g][rc][bc][ctxIdx][k][0] - 1;
-    for (int ctxIdx = 1, n = _pgeom_resid_abs_log2_bits[k] - 1; n >= 0; n--) {
-      auto bin = (numBits >> n) & 1;
-      bits += estimate(bin, ctxs[ctxIdx]);
-      ctxIdx = (ctxIdx << 1) | bin;
-    }
-
-    ctxIdx = std::min(4, (numBits + 1) >> 1);
-    bits += std::max(0, numBits - 1);
-    bits += estimate(res < 0, _ctxSign_g[g][rc][bc][pf][k]);
-  }
-
-  return bits;
 }
 
 // ============================================================================
