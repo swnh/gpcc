@@ -16,30 +16,26 @@ static const int kNumRings = 32;
 static const int kHistSize = 4;
 static const int kCartesianRangeClasses = 3;
 static const int kCartesianBoundaryClasses = 2;
-static const int kCartesianPredModes = 6;
+static const int kCartesianPredModes = 4;
 static const int kCartesianPredFamilies = 2;
-// Packed mode tree nodes per (group, range, boundary):
-//   0: family
-//   1..2: groupBit1 conditioned by family
-//   3..4: groupBit0 conditioned by family, coded only when groupBit1 == 0
-static const int kCartesianPredModeTreeNodes = 5;
+// Two mode bins per (group, range, boundary):
+//   0: mode MSB
+//   1: mode LSB conditioned on modeMSB=0
+//   2: mode LSB conditioned on modeMSB=1
+static const int kCartesianPredModeTreeNodes = 3;
 
-// Mode mapping table for fixed 3-bit mode header:
-//   mode id | family bit | group bits | semantic
-//      0    |     0      |    00      | Zero
-//      1    |     0      |    01      | SameRingLast
-//      2    |     0      |    10      | SameRingLinear2
-//      3    |     1      |    00      | CrossRingUp
-//      4    |     1      |    01      | CrossRingDown
-//      5    |     1      |    10      | SameRingHist1 (legacy histIdx=1 folded into mode)
+// Mode mapping table for fixed 2-bit mode header:
+//   mode bits | semantic
+//      00     | Zero
+//      01     | SameRingLast
+//      10     | CrossRingUp
+//      11     | CrossRingDown
 enum CartesianPredMode
 {
   kPredZero = 0,
   kPredSameRingLast = 1,
-  kPredSameRingLinear2 = 2,
-  kPredCrossRingUp = 3,
-  kPredCrossRingDown = 4,
-  kPredSameRingHist1 = 5,
+  kPredCrossRingUp = 2,
+  kPredCrossRingDown = 3,
 };
 
 struct ModeBits {
@@ -136,68 +132,33 @@ computeRangeClass(int rApprox)
 inline int
 predFamily(int mode)
 {
-  return mode >= kPredCrossRingUp ? 1 : 0;
+  return (mode >> 1) & 1;
 }
 
 inline ModeBits
 modeToBits(int mode)
 {
-  switch (mode) {
-  case kPredZero:
-    return {0, 0b00};
-  case kPredSameRingLast:
-    return {0, 0b01};
-  case kPredSameRingLinear2:
-    return {0, 0b10};
-  case kPredCrossRingUp:
-    return {1, 0b00};
-  case kPredCrossRingDown:
-    return {1, 0b01};
-  case kPredSameRingHist1:
-    return {1, 0b10};
-  default:
+  if (mode < 0 || mode >= kCartesianPredModes)
     throw std::runtime_error("flat predgeom: invalid mode id");
-  }
+  return {(mode >> 1) & 1, mode & 0b11};
 }
 
 inline int
-bitsToMode(int familyBit, int groupBits)
+bitsToMode(int modeMsb, int modeLsb)
 {
-  if (groupBits == 0b11)
-    throw std::runtime_error("flat predgeom: illegal group bits 11");
-
-  if (!familyBit) {
-    if (groupBits == 0b00)
-      return kPredZero;
-    if (groupBits == 0b01)
-      return kPredSameRingLast;
-    return kPredSameRingLinear2;
-  }
-
-  if (groupBits == 0b00)
-    return kPredCrossRingUp;
-  if (groupBits == 0b01)
-    return kPredCrossRingDown;
-  return kPredSameRingHist1;
+  return ((modeMsb & 1) << 1) | (modeLsb & 1);
 }
 
 inline int
-modeTreeNodeFamily()
+modeTreeNodeMsb()
 {
   return 0;
 }
 
 inline int
-modeTreeNodeGroupBit1(int familyBit)
+modeTreeNodeLsb(int modeMsb)
 {
-  return 1 + familyBit;
-}
-
-inline int
-modeTreeNodeGroupBit0(int familyBit, int groupBit1)
-{
-  (void)groupBit1;
-  return 3 + familyBit;
+  return 1 + (modeMsb ? 1 : 0);
 }
 
 inline int
@@ -257,15 +218,6 @@ makeCandidate(const std::array<RingState, kNumRings>& reconState, int laserIdx, 
     }
     break;
 
-  case kPredSameRingLinear2:
-    cand.valid = same.hasPrev();
-    if (cand.valid) {
-      cand.pred = same.last * 2 - same.prev;
-      cand.predR = computeRApprox(cand.pred);
-      cand.boundary = std::abs(same.lastR - same.prevR) > boundaryThreshold();
-    }
-    break;
-
   case kPredCrossRingUp:
     cand.valid = up && up->hasLast();
     if (cand.valid) {
@@ -283,16 +235,6 @@ makeCandidate(const std::array<RingState, kNumRings>& reconState, int laserIdx, 
       cand.predR = down->lastR;
       cand.boundary = same.hasLast()
         && std::abs(down->lastR - same.lastR) > boundaryThreshold();
-    }
-    break;
-
-  case kPredSameRingHist1:
-    cand.valid = same.count >= 2;
-    if (cand.valid) {
-      cand.pred = same.histPts[1];
-      cand.predR = same.histR[1];
-      cand.boundary = same.count >= 3
-        && std::abs(same.histR[1] - same.histR[2]) > boundaryThreshold();
     }
     break;
 

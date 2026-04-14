@@ -802,19 +802,13 @@ int
 PredGeomDecoder::decodeModeHeader(int group, int rangeClass, bool boundary)
 {
   const auto ctx = makeFlatCtxAddr(group, rangeClass, boundary);
-  const int familyBit = _aed->decode(
+  const int modeMsb = _aed->decode(
     _ctxPredMode_g[ctx.ringGroup][ctx.rangeClass][ctx.boundaryClass]
-                  [fp::modeTreeNodeFamily()]);
-  const int groupBit1 = _aed->decode(
+                  [fp::modeTreeNodeMsb()]);
+  const int modeLsb = _aed->decode(
     _ctxPredMode_g[ctx.ringGroup][ctx.rangeClass][ctx.boundaryClass]
-                  [fp::modeTreeNodeGroupBit1(familyBit)]);
-  int groupBit0 = 0;
-  if (!groupBit1) {
-    groupBit0 = _aed->decode(
-      _ctxPredMode_g[ctx.ringGroup][ctx.rangeClass][ctx.boundaryClass]
-                    [fp::modeTreeNodeGroupBit0(familyBit, groupBit1)]);
-  }
-  return fp::bitsToMode(familyBit, (groupBit1 << 1) | groupBit0);
+                  [fp::modeTreeNodeLsb(modeMsb)]);
+  return fp::bitsToMode(modeMsb, modeLsb);
 }
 
 //----------------------------------------------------------------------------

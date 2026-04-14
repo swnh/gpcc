@@ -1751,24 +1751,17 @@ PredGeomEncoder::encodeModeHeader(int mode, int group, int rangeClass, bool boun
 {
   const auto ctx = makeFlatCtxAddr(group, rangeClass, boundary);
   const auto bits = fp::modeToBits(mode);
-  const int groupBit1 = (bits.groupBits >> 1) & 1;
-  const int groupBit0 = bits.groupBits & 1;
+  const int modeMsb = bits.familyBit;
+  const int modeLsb = bits.groupBits & 1;
 
   _aec->encode(
-    bits.familyBit,
+    modeMsb,
     _ctxPredMode_g[ctx.ringGroup][ctx.rangeClass][ctx.boundaryClass]
-                  [fp::modeTreeNodeFamily()]);
+                  [fp::modeTreeNodeMsb()]);
   _aec->encode(
-    groupBit1,
+    modeLsb,
     _ctxPredMode_g[ctx.ringGroup][ctx.rangeClass][ctx.boundaryClass]
-                  [fp::modeTreeNodeGroupBit1(bits.familyBit)]);
-
-  if (!groupBit1) {
-    _aec->encode(
-      groupBit0,
-      _ctxPredMode_g[ctx.ringGroup][ctx.rangeClass][ctx.boundaryClass]
-                    [fp::modeTreeNodeGroupBit0(bits.familyBit, groupBit1)]);
-  }
+                  [fp::modeTreeNodeLsb(modeMsb)]);
 }
 
 //----------------------------------------------------------------------------
@@ -1854,7 +1847,7 @@ encodePredictiveGeometry(
 
   int codedIdx = 0;
   std::array<int64_t, fp::kCartesianPredModes> modeHist = {};
-  std::array<int64_t, 3> groupHist = {};
+  std::array<int64_t, 4> groupHist = {};
   std::array<int64_t, 2> familyHist = {};
   std::array<int64_t, 3> zeroHist = {};
   int64_t qpZeroCount = 0;
@@ -1911,14 +1904,7 @@ encodePredictiveGeometry(
     const auto modeBits = fp::modeToBits(best.mode);
     modeHist[best.mode]++;
     familyHist[modeBits.familyBit]++;
-    if (modeBits.groupBits == 0b00)
-      groupHist[0]++;
-    else if (modeBits.groupBits == 0b01)
-      groupHist[1]++;
-    else if (modeBits.groupBits == 0b10)
-      groupHist[2]++;
-    else
-      throw std::runtime_error("flat predgeom: illegal encoded group bits");
+    groupHist[modeBits.groupBits]++;
 
     for (int k = 0; k < 3; k++)
       zeroHist[k] += bestResidualEncoded[k] == 0;
@@ -1957,8 +1943,8 @@ encodePredictiveGeometry(
   for (int family = 0; family < 2; family++)
     std::cout << " f" << family << "=" << familyHist[family];
   std::cout << std::endl;
-  std::cout << "    Group bits: g00=" << groupHist[0] << " g01=" << groupHist[1]
-            << " g10=" << groupHist[2] << std::endl;
+  std::cout << "    Mode bits: b00=" << groupHist[0] << " b01=" << groupHist[1]
+            << " b10=" << groupHist[2] << " b11=" << groupHist[3] << std::endl;
   std::cout << "    Zero-rate:";
   for (int k = 0; k < 3; k++)
     std::cout << " " << char('x' + k) << "=" << std::fixed
