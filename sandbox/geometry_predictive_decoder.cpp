@@ -115,6 +115,7 @@ public:
   //==================================================
   Vec3<int32_t> decodePredGeom(int group, int mode, int rangeClass, bool boundary);
   int decodeModeHeader(int group, int rangeClass, bool boundary);
+  int decodeFlatFixedQp();
   bool decodeEndOfTreesFlag();
   //==================================================
 
@@ -789,6 +790,15 @@ PredGeomDecoder::decode(
 // ============================================================================
 
 int
+PredGeomDecoder::decodeFlatFixedQp()
+{
+  if (!_aed->decode(_ctxQpOffsetAbsGt0))
+    return 0;
+  return _aed->decodeExpGolomb(0, _ctxQpOffsetAbsEgl) + 1;
+}
+
+//----------------------------------------------------------------------------
+int
 PredGeomDecoder::decodeModeHeader(int group, int rangeClass, bool boundary)
 {
   const auto ctx = makeFlatCtxAddr(group, rangeClass, boundary);
@@ -807,6 +817,7 @@ PredGeomDecoder::decodeModeHeader(int group, int rangeClass, bool boundary)
   return fp::bitsToMode(familyBit, (groupBit1 << 1) | groupBit0);
 }
 
+//----------------------------------------------------------------------------
 Vec3<int32_t>
 PredGeomDecoder::decodePredGeom(
   int group, int mode, int rangeClass, bool boundary)
@@ -887,8 +898,8 @@ void decodePredictiveGeometry(
   PredGeomContexts& ctxtMem,
   EntropyDecoder* arithmeticDecoder,
   int numGroups,
-  bool flatQresEnabled,
-  int flatFixedQp)
+  bool rangeCtxEnabled,
+  bool boundaryCtxEnabled)
 {
   auto numPoints = gbh.footer.geom_num_points_minus1 + 1;
 
@@ -896,29 +907,30 @@ void decodePredictiveGeometry(
   cloud.resize(numPoints);
 
   PredGeomDecoder dec(gps, gbh, ctxtMem, arithmeticDecoder, numGroups);
-  const bool qresQpEnabled = flatQresEnabled;
-  const int fixedQp = std::max(0, flatFixedQp);
+  const int fixedQp = dec.decodeFlatFixedQp();
 
   std::array<fp::RingState, fp::kNumRings> reconState = {};
 
   for (int p = 0; p < numPoints; p++) {
     const int laserIdx = fp::clampLaserIdx(cloud, p);
 
-    const fp::ModeContextKey modeCtx = fp::deriveModeContext(reconState[laserIdx]);
-    const int ctxGroup = (laserIdx > 15) ? 1 : 0;/*fp::ctxGroupForLaser(numGroups, laserIdx);*/
+    const fp::ModeContextKey modeCtxRaw = fp::deriveModeContext(reconState[laserIdx]);
+    const int modeRangeClass = rangeCtxEnabled ? modeCtxRaw.rangeClass : 0;
+    const bool modeBoundary = boundaryCtxEnabled ? modeCtxRaw.boundary : false;
+    const int ctxGroup = fp::ctxGroupForLaser(numGroups, laserIdx);
     const int mode = dec.decodeModeHeader(
-      ctxGroup, modeCtx.rangeClass, modeCtx.boundary);
+      ctxGroup, modeRangeClass, modeBoundary);
 
     const fp::Candidate cand = fp::makeCandidate(reconState, laserIdx, mode);
     if (!cand.valid)
       throw std::runtime_error("flat predgeom: decoded invalid mode candidate");
 
-    const fp::ResidualContextKey residualCtx = fp::deriveResidualContext(cand);
+    const fp::ResidualContextKey residualCtxRaw = fp::deriveResidualContext(cand);
+    const int residualRangeClass = rangeCtxEnabled ? residualCtxRaw.rangeClass : 0;
+    const bool residualBoundary = boundaryCtxEnabled ? residualCtxRaw.boundary : false;
     Vec3<int32_t> residualEncoded = dec.decodePredGeom(
-      ctxGroup, mode, residualCtx.rangeClass, residualCtx.boundary);
-    Vec3<int32_t> residual = qresQpEnabled
-      ? dequantizeFlatResidual(residualEncoded, fixedQp)
-      : residualEncoded;
+      ctxGroup, mode, residualRangeClass, residualBoundary);
+    Vec3<int32_t> residual = dequantizeFlatResidual(residualEncoded, fixedQp);
     point_t reconPoint = cand.pred + residual;
 
     reconState[laserIdx].push(reconPoint, fp::computeRApprox(reconPoint));

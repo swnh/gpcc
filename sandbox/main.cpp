@@ -42,15 +42,17 @@ using namespace pcc;
 // Minimal parameters for the simplified flow
 // ============================================================================
 struct SimpleParams {
-  string inputPlyPath;                         // --input
-  string outputBitstreamPath = "predgeom.bin";  // --output
-  string reconstructedPath = "recon.ply";       // --recon
-  string decodedPath = "decoded.ply";           // --decoded
+  string inputPlyPath = "/home/swnh/pgc/datasets/nuscenes/v1.0-mini/ply/bin/scene-0061/scene-0061_00.ply";  // --input
+  string outputBitstreamPath = "/home/swnh/gpcc/experiments/predgeom.bin";  // --output
+  string reconstructedPath = "/home/swnh/gpcc/experiments/recon.ply";       // --recon
+  string decodedPath = "/home/swnh/gpcc/experiments/decoded.ply";           // --decoded
   string dumpCsvPath;                           // --dump-csv
   string summaryCsvPath = "scripts/flat_qres_qp_summary.csv";  // --summary-csv
   double inputScale = 1.0;                      // --scale
   int    numGroups  = 1;                        // --groups
   int    flatQp = -1;                           // --flat-qp
+  bool   rangeCtxEnabled = true;                // --range-ctx
+  bool   boundaryCtxEnabled = true;             // --boundary-ctx
 };
 
 // ============================================================================
@@ -66,8 +68,9 @@ void encodePredictiveGeometry(
   PredGeomContexts& ctxtMem,
   EntropyEncoder* arithmeticEncoder,
   int numGroups,
-  bool flatQresEnabled,
   int flatFixedQp,
+  bool rangeCtxEnabled,
+  bool boundaryCtxEnabled,
   const std::string& dumpCsvPath);
 
 void decodePredictiveGeometry(
@@ -77,8 +80,8 @@ void decodePredictiveGeometry(
   PredGeomContexts& ctxtMem,
   EntropyDecoder* arithmeticDecoder,
   int numGroups,
-  bool flatQresEnabled,
-  int flatFixedQp);
+  bool rangeCtxEnabled,
+  bool boundaryCtxEnabled);
 }
 
 // ============================================================================
@@ -91,7 +94,8 @@ parseSimpleArgs(int argc, char* argv[], SimpleParams& p)
          << " [--decoded <decoded.ply>]"
          << " [--scale <inputScale>] [--groups <1|2|4|8|16|32>]"
          << " [--dump-csv <context.csv>]"
-         << " [--flat-qp <int>] [--summary-csv <summary.csv>]\n";
+         << " [--flat-qp <int>] [--range <0|1>] [--boundary <0|1>]"
+         << " [--summary-csv <summary.csv>]\n";
     return false;
   }
   for (int i = 1; i < argc; i++) {
@@ -112,8 +116,12 @@ parseSimpleArgs(int argc, char* argv[], SimpleParams& p)
       p.dumpCsvPath = argv[++i];
     else if (arg == "--summary-csv" && i + 1 < argc)
       p.summaryCsvPath = argv[++i];
-    else if (arg == "--flat-qp" && i + 1 < argc)
+    else if ((arg == "--flat-qp" || arg == "--qp") && i + 1 < argc)
       p.flatQp = atoi(argv[++i]);
+    else if (arg == "--range" && i + 1 < argc)
+      p.rangeCtxEnabled = atoi(argv[++i]) != 0;
+    else if (arg == "--boundary" && i + 1 < argc)
+      p.boundaryCtxEnabled = atoi(argv[++i]) != 0;
     else {
       cerr << "Unknown option: " << arg << "\n";
       return false;
@@ -181,7 +189,6 @@ setupMinimalGPS(GeometryParameterSet& gps)
   // Prediction list
   gps.predgeom_max_pred_index = 0;
   gps.predgeom_radius_threshold_for_pred_list = 0;
-  gps.flat_qres_qp_enabled_flag = false;
   gps.resR_context_qphi_threshold = 0;
   gps.resR_context_qphi_threshold_present_flag = false;
 
@@ -355,14 +362,14 @@ static bool
 findLatestPairForInput(
   const string& path,
   const BppSummaryRow& key,
-  BppSummaryRow* baseline,
-  BppSummaryRow* quantized)
+  BppSummaryRow* baselineQp0,
+  BppSummaryRow* targetQp)
 {
-  if (!baseline || !quantized)
+  if (!baselineQp0 || !targetQp)
     return false;
 
-  *baseline = {};
-  *quantized = {};
+  *baselineQp0 = {};
+  *targetQp = {};
 
   ifstream in(path);
   if (!in.is_open())
@@ -385,15 +392,16 @@ findLatestPairForInput(
         || row.inputScale != key.inputScale)
       continue;
 
-    if (row.mode == "baseline")
-      *baseline = row;
-    else if (row.mode.rfind("quantized_qp", 0) == 0) {
-      if (key.flatQp < 0 || row.flatQp == key.flatQp)
-        *quantized = row;
-    }
+    if (row.mode.rfind("quantized_qp", 0) != 0)
+      continue;
+
+    if (row.flatQp == 0)
+      *baselineQp0 = row;
+    if (row.flatQp == key.flatQp)
+      *targetQp = row;
   }
 
-  return baseline->payloadBytes > 0 && quantized->payloadBytes > 0;
+  return baselineQp0->payloadBytes > 0 && targetQp->payloadBytes > 0;
 }
 
 // ============================================================================
@@ -442,7 +450,7 @@ main(int argc, char* argv[])
 
   GeometryParameterSet gps;
   setupMinimalGPS(gps);
-  const bool flatQresEnabled = params.flatQp >= 0;
+  const int fixedQp = std::max(0, params.flatQp);
 
   GeometryBrickHeader gbh;
   setupMinimalGBH(gbh);
@@ -457,10 +465,10 @@ main(int argc, char* argv[])
 
   cout << "\n[2] Encoding (PredictiveGeometry, flat ring-based loop, "
        << params.numGroups << " context group(s)) ..." << endl;
-  cout << "  Flat residual coding mode: "
-       << (flatQresEnabled ? "quantized-index" : "baseline") << endl;
-  if (flatQresEnabled)
-    cout << "  Fixed flat QP: " << params.flatQp << endl;
+  cout << "  Flat residual coding mode: quantized-index" << endl;
+  cout << "  Fixed flat QP (stream-signaled): " << fixedQp << endl;
+  cout << "  Context toggles: range=" << (params.rangeCtxEnabled ? 1 : 0)
+       << " boundary=" << (params.boundaryCtxEnabled ? 1 : 0) << endl;
   if (!params.dumpCsvPath.empty())
     cout << "  Dumping per-point context CSV to: " << params.dumpCsvPath << endl;
 
@@ -481,7 +489,7 @@ main(int argc, char* argv[])
   encodePredictiveGeometry(
     predGeomOpt, gps, gbh, cloud,
     ctxtMem, aec.get(), params.numGroups,
-    flatQresEnabled, params.flatQp, params.dumpCsvPath);
+    fixedQp, params.rangeCtxEnabled, params.boundaryCtxEnabled, params.dumpCsvPath);
 
   clock_user.stop();
   clock_wall.stop();
@@ -553,7 +561,7 @@ main(int argc, char* argv[])
   decodePredictiveGeometry(
     gps, gbhFromBitstream, decCloud,
     decCtxtMem, aed.get(), params.numGroups,
-    flatQresEnabled, params.flatQp);
+    params.rangeCtxEnabled, params.boundaryCtxEnabled);
 
   // ---- 9. Write decoder output ----
   if (!writePointCloudPly(decCloud, params.inputScale, params.decodedPath)) {
@@ -593,38 +601,38 @@ main(int argc, char* argv[])
   cout << "\n[8] Results:" << endl;
   cout << "  Payload size:     " << payload.size() << " B ("
        << bpp << " bpp)" << endl;
-  cout << "  Mode:             "
-       << (flatQresEnabled ? "quantized" : "baseline") << endl;
+  cout << "  Mode:             quantized_qp" << fixedQp << endl;
 
   BppSummaryRow runRow;
   runRow.inputPlyPath = params.inputPlyPath;
   runRow.numPoints = int(numPoints);
   runRow.groups = params.numGroups;
   runRow.inputScale = params.inputScale;
-  runRow.flatQp = params.flatQp;
-  runRow.mode = flatQresEnabled
-    ? ("quantized_qp" + std::to_string(params.flatQp))
-    : "baseline";
+  runRow.flatQp = fixedQp;
+  runRow.mode = "quantized_qp" + std::to_string(fixedQp);
   runRow.payloadBytes = payload.size();
   runRow.bpp = bpp;
 
   if (appendBppSummaryCsv(params.summaryCsvPath, runRow)) {
     cout << "  Summary CSV:      " << params.summaryCsvPath << endl;
-    BppSummaryRow baseRow;
-    BppSummaryRow quantRow;
-    if (findLatestPairForInput(params.summaryCsvPath, runRow, &baseRow, &quantRow)) {
-      const double dBytes = double(quantRow.payloadBytes) - double(baseRow.payloadBytes);
-      const double dBpp = quantRow.bpp - baseRow.bpp;
-      const double dPct = baseRow.bpp > 0 ? (100.0 * dBpp / baseRow.bpp) : 0.0;
-      cout << "\n  Paired bpp comparison:" << endl;
-      cout << "    baseline : " << baseRow.payloadBytes << " B, " << baseRow.bpp << " bpp" << endl;
-      cout << "    quantized(qp=" << quantRow.flatQp << "): "
-           << quantRow.payloadBytes << " B, " << quantRow.bpp << " bpp" << endl;
+    BppSummaryRow qp0Row;
+    BppSummaryRow currentRow;
+    if (fixedQp > 0
+        && findLatestPairForInput(params.summaryCsvPath, runRow, &qp0Row, &currentRow)) {
+      const double dBytes = double(currentRow.payloadBytes) - double(qp0Row.payloadBytes);
+      const double dBpp = currentRow.bpp - qp0Row.bpp;
+      const double dPct = qp0Row.bpp > 0 ? (100.0 * dBpp / qp0Row.bpp) : 0.0;
+      cout << "\n  Paired bpp comparison vs QP0:" << endl;
+      cout << "    qp0      : " << qp0Row.payloadBytes << " B, " << qp0Row.bpp << " bpp" << endl;
+      cout << "    qp" << currentRow.flatQp << "      : "
+           << currentRow.payloadBytes << " B, " << currentRow.bpp << " bpp" << endl;
       cout << "    delta    : " << dBytes << " B, " << dBpp << " bpp ("
            << std::showpos << dPct << "%" << std::noshowpos << ")" << endl;
+    } else if (fixedQp == 0) {
+      cout << "  QP0 run recorded (reference point for paired comparisons)." << endl;
     } else {
       cout << "  Paired comparison not available yet "
-           << "(need both baseline and quantized rows for this input)." << endl;
+           << "(need a QP0 row for this input)." << endl;
     }
   } else {
     cout << "  Warning: failed to append summary CSV at " << params.summaryCsvPath << endl;

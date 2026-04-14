@@ -255,6 +255,7 @@ public:
   void encodeRefNodeIdx(int refNodeIdx, bool globalMotionEnabled);
   void encodeRefDirFlag(bool refDirFlag);
   void encodeQpOffset(int dqp);
+  void encodeFlatFixedQp(int qp);
   void encodeEndOfTreesFlag(int endFlag);
 
 
@@ -1732,6 +1733,19 @@ encodePredictiveGeometry(
 // ============================================================================
 // Predictive Geometry Coding Cartesian
 // ============================================================================
+
+void
+PredGeomEncoder::encodeFlatFixedQp(int qp)
+{
+  if (qp < 0)
+    throw std::runtime_error("flat predgeom: fixed QP must be non-negative");
+  _aec->encode(qp != 0, _ctxQpOffsetAbsGt0);
+  if (!qp)
+    return;
+  _aec->encodeExpGolomb(qp - 1, 0, _ctxQpOffsetAbsEgl);
+}
+
+//----------------------------------------------------------------------------
 void
 PredGeomEncoder::encodeModeHeader(int mode, int group, int rangeClass, bool boundary)
 {
@@ -1757,6 +1771,7 @@ PredGeomEncoder::encodeModeHeader(int mode, int group, int rangeClass, bool boun
   }
 }
 
+//----------------------------------------------------------------------------
 void
 PredGeomEncoder::encodePredGeom(
   const Vec3<int32_t>& residual,
@@ -1814,8 +1829,9 @@ encodePredictiveGeometry(
   PredGeomContexts& ctxtMem,
   EntropyEncoder* arithmeticEncoder,
   int numGroups,
-  bool flatQresEnabled,
   int flatFixedQp,
+  bool rangeCtxEnabled,
+  bool boundaryCtxEnabled,
   const std::string& dumpCsvPath)
 {
   auto numPoints = cloud.getPointCount();
@@ -1843,14 +1859,16 @@ encodePredictiveGeometry(
   std::array<int64_t, 3> zeroHist = {};
   int64_t qpZeroCount = 0;
   int64_t totalL1 = 0;
-  const bool qresQpEnabled = flatQresEnabled;
   const int fixedQp = std::max(0, flatFixedQp);
+  enc.encodeFlatFixedQp(fixedQp);
 
   for (int p = 0; p < numPoints; p++) {
     const auto& curr = cloud[p];
     const int laserIdx = fp::clampLaserIdx(cloud, p);
 
-    const fp::ModeContextKey modeCtx = fp::deriveModeContext(reconState[laserIdx]);
+    const fp::ModeContextKey modeCtxRaw = fp::deriveModeContext(reconState[laserIdx]);
+    const int modeRangeClass = rangeCtxEnabled ? modeCtxRaw.rangeClass : 0;
+    const bool modeBoundary = boundaryCtxEnabled ? modeCtxRaw.boundary : false;
 
     fp::Candidate best;
     point_t bestResidualEncoded = 0;
@@ -1863,16 +1881,12 @@ encodePredictiveGeometry(
         continue;
 
       const point_t residualRaw = curr - cand.pred;
-      const point_t residualEncoded = qresQpEnabled
-        ? quantizeFlatResidual(residualRaw, fixedQp)
-        : residualRaw;
+      const point_t residualEncoded = quantizeFlatResidual(residualRaw, fixedQp);
       const int64_t l1 = fp::residualL1(residualEncoded);
       if (l1 < bestL1 || (l1 == bestL1 && mode < best.mode)) {
         best = cand;
         bestResidualEncoded = residualEncoded;
-        bestResidualRecon = qresQpEnabled
-          ? dequantizeFlatResidual(residualEncoded, fixedQp)
-          : residualEncoded;
+        bestResidualRecon = dequantizeFlatResidual(residualEncoded, fixedQp);
         bestL1 = l1;
       }
     }
@@ -1880,13 +1894,15 @@ encodePredictiveGeometry(
     if (bestL1 == std::numeric_limits<int64_t>::max())
       throw std::runtime_error("flat predgeom: no valid mode candidate");
 
-    const int ctxGroup = (laserIdx > 15) ? 1 : 0;/*fp::ctxGroupForLaser(numGroups, laserIdx);*/
-    enc.encodeModeHeader(best.mode, ctxGroup, modeCtx.rangeClass, modeCtx.boundary);
+    const int ctxGroup = fp::ctxGroupForLaser(numGroups, laserIdx);
+    enc.encodeModeHeader(best.mode, ctxGroup, modeRangeClass, modeBoundary);
 
-    const fp::ResidualContextKey residualCtx = fp::deriveResidualContext(best);
+    const fp::ResidualContextKey residualCtxRaw = fp::deriveResidualContext(best);
+    const int residualRangeClass = rangeCtxEnabled ? residualCtxRaw.rangeClass : 0;
+    const bool residualBoundary = boundaryCtxEnabled ? residualCtxRaw.boundary : false;
     enc.encodePredGeom(
-      bestResidualEncoded, ctxGroup, best.mode, residualCtx.rangeClass,
-      residualCtx.boundary);
+      bestResidualEncoded, ctxGroup, best.mode, residualRangeClass,
+      residualBoundary);
 
     const point_t reconPoint = best.pred + bestResidualRecon;
     const int reconR = fp::computeRApprox(reconPoint);
@@ -1911,8 +1927,8 @@ encodePredictiveGeometry(
     totalL1 += bestL1;
 
     dumpWriter.writeRow(
-      codedIdx, p, laserIdx, ctxGroup, modeCtx.rangeClass, modeCtx.boundary,
-      residualCtx.rangeClass, residualCtx.boundary, best.mode, modeBits, best.pred, curr,
+      codedIdx, p, laserIdx, ctxGroup, modeRangeClass, modeBoundary,
+      residualRangeClass, residualBoundary, best.mode, modeBits, best.pred, curr,
       bestResidualRecon, bestL1, reconPoint, best.predR, reconR);
 
     codedOrder[codedIdx] = p;
@@ -1951,14 +1967,12 @@ encodePredictiveGeometry(
   std::cout << std::defaultfloat << std::endl;
   std::cout << "    Avg L1: "
             << (codedIdx ? double(totalL1) / codedIdx : 0.0) << std::endl;
-  if (qresQpEnabled) {
-    std::cout << "    Fixed QP: " << fixedQp;
-    std::cout << " all-zero-residual-rate="
-              << std::fixed << std::setprecision(3)
-              << (codedIdx ? double(qpZeroCount) / codedIdx : 0.0)
-              << std::defaultfloat;
-    std::cout << std::endl;
-  }
+  std::cout << "    Fixed QP: " << fixedQp;
+  std::cout << " all-zero-residual-rate="
+            << std::fixed << std::setprecision(3)
+            << (codedIdx ? double(qpZeroCount) / codedIdx : 0.0)
+            << std::defaultfloat;
+  std::cout << std::endl;
 
   swap(cloud, outCloud);
 }
