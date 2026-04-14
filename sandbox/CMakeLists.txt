@@ -37,7 +37,7 @@ set(ORIGINAL_SOURCES
     ${ORIGINAL_SRC_DIR}/geometry_octree.cpp
     ${ORIGINAL_SRC_DIR}/geometry_octree_decoder.cpp
     ${ORIGINAL_SRC_DIR}/geometry_octree_encoder.cpp
-    ${ORIGINAL_SRC_DIR}/geometry_predictive_decoder.cpp
+    # ${ORIGINAL_SRC_DIR}/geometry_predictive_decoder.cpp
     # ${ORIGINAL_SRC_DIR}/geometry_predictive_encoder.cpp # REPLACED BY CUSTOM
     ${ORIGINAL_SRC_DIR}/geometry_trisoup_decoder.cpp
     ${ORIGINAL_SRC_DIR}/geometry_trisoup_encoder.cpp
@@ -57,7 +57,7 @@ set(ORIGINAL_SOURCES
 # Custom
 set(CUSTOM_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp
-    #${CMAKE_CURRENT_SOURCE_DIR}/predGeom.cpp    
+    ${CMAKE_CURRENT_SOURCE_DIR}/geometry_predictive_decoder.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/geometry_predictive_encoder.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/ply.cpp
 )

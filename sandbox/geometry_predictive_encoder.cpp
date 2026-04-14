@@ -35,6 +35,7 @@
 
 #include "geometry_predictive.h"
 #include "geometry.h"
+#include "flat_predgeom_common.h"
 #include "pointset_processing.h"
 #include "quantization.h"
 
@@ -43,6 +44,10 @@
 #include "nanoflann.hpp"
 #include <algorithm>
 #include <bitset>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <string>
 
 namespace pcc {
 
@@ -74,70 +79,107 @@ namespace {
   {
     return -log2(dirac::approxSymbolProbability(bit, model) / 128.);
   }
+
+  // Canonicalized address used by flat cartesian mode/residual contexts.
+  struct FlatCtxAddr {
+    int ringGroup;
+    int rangeClass;
+    int boundaryClass;
+  };
+
+  inline FlatCtxAddr
+  makeFlatCtxAddr(int group, int rangeClass, bool boundary)
+  {
+    return {
+      group,
+      std::max(
+        0, std::min(flat_predgeom::kCartesianRangeClasses - 1, rangeClass)),
+      boundary ? 1 : 0};
+  }
+
+  inline point_t
+  quantizeFlatResidual(const point_t& residual, int qp)
+  {
+    QuantizerGeom quantizer(qp);
+    point_t out = 0;
+    for (int k = 0; k < 3; ++k)
+      out[k] = int32_t(quantizer.quantize(residual[k]));
+    return out;
+  }
+
+  inline point_t
+  dequantizeFlatResidual(const point_t& qResidual, int qp)
+  {
+    QuantizerGeom quantizer(qp);
+    point_t out = 0;
+    for (int k = 0; k < 3; ++k)
+      out[k] = int32_t(quantizer.scale(qResidual[k]));
+    return out;
+  }
+
+  class FlatPredGeomDumpWriter {
+  public:
+    explicit FlatPredGeomDumpWriter(const std::string& csvPath)
+    {
+      if (csvPath.empty())
+        return;
+      _stream.open(csvPath, std::ios::out | std::ios::trunc);
+      if (!_stream.is_open())
+        throw std::runtime_error("flat predgeom: failed to open dump CSV: " + csvPath);
+      _enabled = true;
+      _stream
+        << "coded_idx,src_idx,laser_idx,ctx_group,mode_range_class,mode_boundary,"
+        << "res_range_class,res_boundary,mode,mode_family,mode_group_bits,"
+        << "pred_x,pred_y,pred_z,curr_x,curr_y,curr_z,res_x,res_y,res_z,res_l1,"
+        << "recon_x,recon_y,recon_z,pred_r,recon_r\n";
+    }
+
+    void writeRow(
+      int codedIdx,
+      int srcIdx,
+      int laserIdx,
+      int ctxGroup,
+      int modeRangeClass,
+      bool modeBoundary,
+      int resRangeClass,
+      bool resBoundary,
+      int mode,
+      const flat_predgeom::ModeBits& modeBits,
+      const point_t& pred,
+      const point_t& curr,
+      const point_t& residual,
+      int64_t residualL1,
+      const point_t& reconPoint,
+      int predR,
+      int reconR)
+    {
+      if (!_enabled)
+        return;
+
+      _stream
+        << codedIdx << ',' << srcIdx << ',' << laserIdx << ','
+        << ctxGroup << ',' << modeRangeClass << ',' << (modeBoundary ? 1 : 0) << ','
+        << resRangeClass << ',' << (resBoundary ? 1 : 0) << ','
+        << mode << ',' << modeBits.familyBit << ',' << modeBits.groupBits << ','
+        << pred[0] << ',' << pred[1] << ',' << pred[2] << ','
+        << curr[0] << ',' << curr[1] << ',' << curr[2] << ','
+        << residual[0] << ',' << residual[1] << ',' << residual[2] << ','
+        << residualL1 << ','
+        << reconPoint[0] << ',' << reconPoint[1] << ',' << reconPoint[2] << ','
+        << predR << ',' << reconR << '\n';
+    }
+
+  private:
+    bool _enabled = false;
+    std::ofstream _stream;
+  };
 }  // namespace
 
 //============================================================================
 
 // Max ring groups for context array sizing (compile-time)
 static const int kMaxRingGroups = 32;
-static const int kNumRings = 32;
-static const int kHistSize = 7;
-static const int kCartesianRangeClasses = 3;
-static const int kCartesianBoundaryClasses = 2;
-static const int kCartesianPredModes = 6;
-
-namespace {
-
-enum CartesianPredMode
-{
-  kPredZero = 0,
-  kPredSameRingLast = 1,
-  kPredSameRingLinear2 = 2,
-  kPredCrossRingUp = 3,
-  kPredCrossRingDown = 4,
-  kPredFusedPrevPhi = 5,
-};
-
-inline int
-clampLaserIdx(const PCCPointSet3& cloud, int idx)
-{
-  if (!cloud.hasLaserAngles())
-    return std::max(0, std::min(kNumRings - 1, idx));
-  return std::max(0, std::min(kNumRings - 1, cloud.getLaserAngle(idx)));
-}
-
-inline int
-computeRApprox(const point_t& pt)
-{
-  auto absX = std::abs(pt[0]);
-  auto absY = std::abs(pt[1]);
-  return std::max(absX, absY) + ((424 * std::min(absX, absY)) >> 10);
-}
-
-inline int
-computeRangeClass(int rApprox)
-{
-  if (rApprox < 1 << 10)
-    return 0;
-  if (rApprox < 1 << 12)
-    return 1;
-  return 2;
-}
-
-inline int
-modeBias(int mode)
-{
-  static const int kModeBias[kCartesianPredModes] = {96, 24, 28, 48, 48, 36};
-  return kModeBias[mode];
-}
-
-inline int
-boundaryThreshold()
-{
-  return 384;
-}
-
-}  // namespace
+namespace fp = flat_predgeom;
 
 class PredGeomEncoder : protected PredGeomContexts {
 public:
@@ -188,7 +230,7 @@ public:
     int mode,
     int rangeClass,
     bool boundary);
-  void encodeMode(int mode, int group, int rangeClass, bool boundary);
+  void encodeModeHeader(int mode, int group, int rangeClass, bool boundary);
   //==================================================
 
   void encodeResidual(const Vec3<int32_t>& residual, int iMode, int multiplier, int rPred, int predIdx, const bool interFlag
@@ -213,6 +255,7 @@ public:
   void encodeRefNodeIdx(int refNodeIdx, bool globalMotionEnabled);
   void encodeRefDirFlag(bool refDirFlag);
   void encodeQpOffset(int dqp);
+  void encodeFlatFixedQp(int qp);
   void encodeEndOfTreesFlag(int endFlag);
 
 
@@ -286,14 +329,14 @@ private:
 
   // ---- Per-ring-group context arrays (used by encodePredGeom) ----
   int _numRingGroups;  // runtime: 1, 2, 4, 8, 16, or 32
-  AdaptiveBitModel _ctxResGt0_g[kMaxRingGroups][kCartesianRangeClasses]
-                              [kCartesianBoundaryClasses][kCartesianPredModes][3];
-  AdaptiveBitModel _ctxSign_g[kMaxRingGroups][kCartesianRangeClasses]
-                             [kCartesianBoundaryClasses][3];
-  AdaptiveBitModel _ctxNumBits_g[kMaxRingGroups][kCartesianRangeClasses]
-                                [kCartesianBoundaryClasses][8][3][31];
-  AdaptiveBitModel _ctxPredMode_g[kMaxRingGroups][kCartesianRangeClasses]
-                                 [kCartesianBoundaryClasses][kCartesianPredModes];
+  AdaptiveBitModel _ctxResGt0_g[kMaxRingGroups][fp::kCartesianRangeClasses]
+                              [fp::kCartesianBoundaryClasses][fp::kCartesianPredFamilies][3];
+  AdaptiveBitModel _ctxSign_g[kMaxRingGroups][fp::kCartesianRangeClasses]
+                             [fp::kCartesianBoundaryClasses][fp::kCartesianPredFamilies][3];
+  AdaptiveBitModel _ctxNumBits_g[kMaxRingGroups][fp::kCartesianRangeClasses]
+                                [fp::kCartesianBoundaryClasses][8][3][31];
+  AdaptiveBitModel _ctxPredMode_g[kMaxRingGroups][fp::kCartesianRangeClasses]
+                                 [fp::kCartesianBoundaryClasses][fp::kCartesianPredModeTreeNodes];
 };
 
 //============================================================================
@@ -1690,20 +1733,45 @@ encodePredictiveGeometry(
 // ============================================================================
 // Predictive Geometry Coding Cartesian
 // ============================================================================
-void
-PredGeomEncoder::encodeMode(int mode, int group, int rangeClass, bool boundary)
-{
-  const int g = group;
-  const int rc = std::max(0, std::min(kCartesianRangeClasses - 1, rangeClass));
-  const int bc = boundary ? 1 : 0;
 
-  for (int i = 0; i < mode; ++i)
-    _aec->encode(1, _ctxPredMode_g[g][rc][bc][i]);
-  if (mode < kCartesianPredModes - 1)
-    _aec->encode(0, _ctxPredMode_g[g][rc][bc][mode]);
+void
+PredGeomEncoder::encodeFlatFixedQp(int qp)
+{
+  if (qp < 0)
+    throw std::runtime_error("flat predgeom: fixed QP must be non-negative");
+  _aec->encode(qp != 0, _ctxQpOffsetAbsGt0);
+  if (!qp)
+    return;
+  _aec->encodeExpGolomb(qp - 1, 0, _ctxQpOffsetAbsEgl);
 }
 
+//----------------------------------------------------------------------------
+void
+PredGeomEncoder::encodeModeHeader(int mode, int group, int rangeClass, bool boundary)
+{
+  const auto ctx = makeFlatCtxAddr(group, rangeClass, boundary);
+  const auto bits = fp::modeToBits(mode);
+  const int groupBit1 = (bits.groupBits >> 1) & 1;
+  const int groupBit0 = bits.groupBits & 1;
 
+  _aec->encode(
+    bits.familyBit,
+    _ctxPredMode_g[ctx.ringGroup][ctx.rangeClass][ctx.boundaryClass]
+                  [fp::modeTreeNodeFamily()]);
+  _aec->encode(
+    groupBit1,
+    _ctxPredMode_g[ctx.ringGroup][ctx.rangeClass][ctx.boundaryClass]
+                  [fp::modeTreeNodeGroupBit1(bits.familyBit)]);
+
+  if (!groupBit1) {
+    _aec->encode(
+      groupBit0,
+      _ctxPredMode_g[ctx.ringGroup][ctx.rangeClass][ctx.boundaryClass]
+                    [fp::modeTreeNodeGroupBit0(bits.familyBit, groupBit1)]);
+  }
+}
+
+//----------------------------------------------------------------------------
 void
 PredGeomEncoder::encodePredGeom(
   const Vec3<int32_t>& residual,
@@ -1712,35 +1780,41 @@ PredGeomEncoder::encodePredGeom(
   int rangeClass,
   bool boundary)
 {
-  const int g = group;
-  const int rc = std::max(0, std::min(kCartesianRangeClasses - 1, rangeClass));
-  const int bc = boundary ? 1 : 0;
-  const int mc = std::max(0, std::min(kCartesianPredModes - 1, mode));
+  const auto ctx = makeFlatCtxAddr(group, rangeClass, boundary);
+  const int mc = std::max(0, std::min(fp::kCartesianPredModes - 1, mode));
+  const int pf = fp::predFamily(mc);
 
-  int k = 0;
-  for (int ctxIdx = 0; k < 3; k++) {
-    const auto res = residual[k];
-    _aec->encode(res != 0, _ctxResGt0_g[g][rc][bc][mc][k]);
+  int magnitudeCtx = 0;
+  for (int axis = 0; axis < 3; axis++) {
+    const auto res = residual[axis];
+    _aec->encode(
+      res != 0,
+      _ctxResGt0_g[ctx.ringGroup][ctx.rangeClass][ctx.boundaryClass][pf][axis]);
     if (!res)
       continue;
 
     int32_t value = abs(res) - 1;
     int32_t numBits = 1 + ilog2(uint32_t(value));
 
-    AdaptiveBitModel* ctxs = &_ctxNumBits_g[g][rc][bc][ctxIdx][k][0] - 1;
-    for (int ctxIdx = 1, n = _pgeom_resid_abs_log2_bits[k] - 1; n >= 0; n--) {
+    AdaptiveBitModel* bitlenTree =
+      &_ctxNumBits_g[ctx.ringGroup][ctx.rangeClass][ctx.boundaryClass][magnitudeCtx][axis][0]
+      - 1;
+    int bitlenNode = 1;
+    for (int n = _pgeom_resid_abs_log2_bits[axis] - 1; n >= 0; n--) {
       auto bin = (numBits >> n) & 1;
-      _aec->encode(bin, ctxs[ctxIdx]);
-      ctxIdx = (ctxIdx << 1) | bin;
+      _aec->encode(bin, bitlenTree[bitlenNode]);
+      bitlenNode = (bitlenNode << 1) | bin;
     }
 
-    ctxIdx = std::min(7, (numBits + 1) >> 1);
+    magnitudeCtx = std::min(4, (numBits + 1) >> 1);
 
     --numBits;
     for (int32_t i = 0; i < numBits; ++i)
       _aec->encode((value >> i) & 1);
 
-    _aec->encode(res < 0, _ctxSign_g[g][rc][bc][k]);
+    _aec->encode(
+      res < 0,
+      _ctxSign_g[ctx.ringGroup][ctx.rangeClass][ctx.boundaryClass][pf][axis]);
   }
 }
 
@@ -1754,9 +1828,14 @@ encodePredictiveGeometry(
   PCCPointSet3& cloud,
   PredGeomContexts& ctxtMem,
   EntropyEncoder* arithmeticEncoder,
-  int numGroups)
+  int numGroups,
+  int flatFixedQp,
+  bool rangeCtxEnabled,
+  bool boundaryCtxEnabled,
+  const std::string& dumpCsvPath)
 {
   auto numPoints = cloud.getPointCount();
+  FlatPredGeomDumpWriter dumpWriter(dumpCsvPath);
 
   PCCPointSet3 outCloud;
   outCloud.addRemoveAttributes(cloud.hasColors(), cloud.hasReflectances());
@@ -1766,225 +1845,134 @@ encodePredictiveGeometry(
 
   std::vector<int32_t> codedOrder(numPoints, -1);
 
-  // Fixed residual bit-depth
-  for (int k = 0; k < 3; k++) {
+  for (int k = 0; k < 3; k++)
     gbh.pgeom_resid_abs_log2_bits[k] = 5;
-  }
 
   PredGeomEncoder enc(gps, gbh, opt, ctxtMem, arithmeticEncoder, numGroups);
 
-  struct RingState {
-    point_t last = 0;
-    point_t prev = 0;
-    int lastR = 0;
-    int prevR = 0;
-    int count = 0;
-
-    bool hasLast() const { return count >= 1; }
-    bool hasPrev() const { return count >= 2; }
-
-    void push(const point_t& pt, int rApprox)
-    {
-      prev = last;
-      prevR = lastR;
-      last = pt;
-      lastR = rApprox;
-      count = std::min(count + 1, 2);
-    }
-  };
-
-  struct Candidate {
-    int mode = kPredZero;
-    point_t pred = 0;
-    int predR = 0;
-    int rangeClass = 0;
-    bool boundary = false;
-    bool valid = true;
-  };
-
-  std::array<RingState, kNumRings> reconState = {};
-
-  auto ctxGroupForLaser = [numGroups](int laserIdx) {
-    const int ringsPerGroup = std::max(1, kNumRings / numGroups);
-    return std::min(numGroups - 1, std::max(0, laserIdx / ringsPerGroup));
-  };
-
-  auto roundedDiv = [](int sum, int div) {
-    if (sum >= 0)
-      return (sum + (div >> 1)) / div;
-    return -((-sum + (div >> 1)) / div);
-  };
-
-  auto makeCandidate = [&](int laserIdx, int mode) {
-    Candidate cand;
-    cand.mode = mode;
-    cand.valid = true;
-
-    const auto& same = reconState[laserIdx];
-    const auto* up = laserIdx > 0 ? &reconState[laserIdx - 1] : nullptr;
-    const auto* down = laserIdx + 1 < kNumRings ? &reconState[laserIdx + 1] : nullptr;
-
-    switch (mode) {
-    case kPredZero:
-      cand.pred = 0;
-      cand.predR = 0;
-      cand.boundary = false;
-      break;
-
-    case kPredSameRingLast:
-      cand.valid = same.hasLast();
-      if (cand.valid) {
-        cand.pred = same.last;
-        cand.predR = same.lastR;
-        cand.boundary = same.hasPrev()
-          && std::abs(same.lastR - same.prevR) > boundaryThreshold();
-      }
-      break;
-
-    case kPredSameRingLinear2:
-      cand.valid = same.hasPrev();
-      if (cand.valid) {
-        cand.pred = same.last * 2 - same.prev;
-        cand.predR = computeRApprox(cand.pred);
-        cand.boundary = std::abs(same.lastR - same.prevR) > boundaryThreshold();
-      }
-      break;
-
-    case kPredCrossRingUp:
-      cand.valid = up && up->hasLast();
-      if (cand.valid) {
-        cand.pred = up->last;
-        cand.predR = up->lastR;
-        cand.boundary = same.hasLast()
-          && std::abs(up->lastR - same.lastR) > boundaryThreshold();
-      }
-      break;
-
-    case kPredCrossRingDown:
-      cand.valid = down && down->hasLast();
-      if (cand.valid) {
-        cand.pred = down->last;
-        cand.predR = down->lastR;
-        cand.boundary = same.hasLast()
-          && std::abs(down->lastR - same.lastR) > boundaryThreshold();
-      }
-      break;
-
-    case kPredFusedPrevPhi: {
-      int sum[3] = {};
-      int count = 0;
-      bool boundary = false;
-      cand.valid = same.hasLast();
-      if (same.hasLast()) {
-        for (int k = 0; k < 3; k++)
-          sum[k] += same.last[k];
-        count++;
-      }
-      if (up && up->hasLast()) {
-        for (int k = 0; k < 3; k++)
-          sum[k] += up->last[k];
-        count++;
-        boundary |= same.hasLast()
-          && std::abs(up->lastR - same.lastR) > boundaryThreshold();
-      }
-      if (down && down->hasLast()) {
-        for (int k = 0; k < 3; k++)
-          sum[k] += down->last[k];
-        count++;
-        boundary |= same.hasLast()
-          && std::abs(down->lastR - same.lastR) > boundaryThreshold();
-      }
-      cand.valid = count >= 2;
-      if (cand.valid) {
-        for (int k = 0; k < 3; k++)
-          cand.pred[k] = roundedDiv(sum[k], count);
-        cand.predR = computeRApprox(cand.pred);
-        cand.boundary = boundary;
-      }
-      break;
-    }
-
-    default:
-      cand.valid = false;
-      break;
-    }
-
-    cand.rangeClass = computeRangeClass(cand.predR);
-    return cand;
-  };
-
-  auto residualCost = [](const point_t& a, const point_t& b) {
-    return std::abs(a[0] - b[0]) + std::abs(a[1] - b[1]) + std::abs(a[2] - b[2]);
-  };
+  std::array<fp::RingState, fp::kNumRings> reconState = {};
 
   int codedIdx = 0;
+  std::array<int64_t, fp::kCartesianPredModes> modeHist = {};
+  std::array<int64_t, 3> groupHist = {};
+  std::array<int64_t, 2> familyHist = {};
+  std::array<int64_t, 3> zeroHist = {};
+  int64_t qpZeroCount = 0;
+  int64_t totalL1 = 0;
+  const int fixedQp = std::max(0, flatFixedQp);
+  enc.encodeFlatFixedQp(fixedQp);
+
   for (int p = 0; p < numPoints; p++) {
     const auto& curr = cloud[p];
-    const int laserIdx = clampLaserIdx(cloud, p);
-    const int currR = computeRApprox(curr);
-    int modeRangeClass = 0;
-    bool modeBoundary = false;
-    if (reconState[laserIdx].hasLast()) {
-      modeRangeClass = computeRangeClass(reconState[laserIdx].lastR);
-      modeBoundary = reconState[laserIdx].hasPrev()
-        && std::abs(reconState[laserIdx].lastR - reconState[laserIdx].prevR)
-             > boundaryThreshold();
-    }
+    const int laserIdx = fp::clampLaserIdx(cloud, p);
 
-    Candidate best;
-    int bestCost = std::numeric_limits<int>::max();
-    for (int mode = 0; mode < kCartesianPredModes; mode++) {
-      auto cand = makeCandidate(laserIdx, mode);
+    const fp::ModeContextKey modeCtxRaw = fp::deriveModeContext(reconState[laserIdx]);
+    const int modeRangeClass = rangeCtxEnabled ? modeCtxRaw.rangeClass : 0;
+    const bool modeBoundary = boundaryCtxEnabled ? modeCtxRaw.boundary : false;
+
+    fp::Candidate best;
+    point_t bestResidualEncoded = 0;
+    point_t bestResidualRecon = 0;
+    int64_t bestL1 = std::numeric_limits<int64_t>::max();
+
+    for (int mode = 0; mode < fp::kCartesianPredModes; mode++) {
+      const auto cand = fp::makeCandidate(reconState, laserIdx, mode);
       if (!cand.valid)
         continue;
 
-      if (mode >= kPredCrossRingUp
-          && std::abs(currR - cand.predR) > (boundaryThreshold() << 1)) {
-        continue;
-      }
-
-      int cost = residualCost(curr, cand.pred) + modeBias(mode);
-      if (cand.boundary && mode >= kPredCrossRingUp)
-        cost += 24;
-
-      if (cost < bestCost) {
+      const point_t residualRaw = curr - cand.pred;
+      const point_t residualEncoded = quantizeFlatResidual(residualRaw, fixedQp);
+      const int64_t l1 = fp::residualL1(residualEncoded);
+      if (l1 < bestL1 || (l1 == bestL1 && mode < best.mode)) {
         best = cand;
-        bestCost = cost;
+        bestResidualEncoded = residualEncoded;
+        bestResidualRecon = dequantizeFlatResidual(residualEncoded, fixedQp);
+        bestL1 = l1;
       }
     }
 
-    const point_t residual = curr - best.pred;
-    const int ctxGroup = ctxGroupForLaser(laserIdx);
+    if (bestL1 == std::numeric_limits<int64_t>::max())
+      throw std::runtime_error("flat predgeom: no valid mode candidate");
 
-    enc.encodeMode(best.mode, ctxGroup, modeRangeClass, modeBoundary);
+    const int ctxGroup = fp::ctxGroupForLaser(numGroups, laserIdx);
+    enc.encodeModeHeader(best.mode, ctxGroup, modeRangeClass, modeBoundary);
+
+    const fp::ResidualContextKey residualCtxRaw = fp::deriveResidualContext(best);
+    const int residualRangeClass = rangeCtxEnabled ? residualCtxRaw.rangeClass : 0;
+    const bool residualBoundary = boundaryCtxEnabled ? residualCtxRaw.boundary : false;
     enc.encodePredGeom(
-      residual, ctxGroup, best.mode, best.rangeClass, best.boundary);
+      bestResidualEncoded, ctxGroup, best.mode, residualRangeClass,
+      residualBoundary);
 
-    const point_t reconPoint = best.pred + residual;
-    reconState[laserIdx].push(reconPoint, computeRApprox(reconPoint));
+    const point_t reconPoint = best.pred + bestResidualRecon;
+    const int reconR = fp::computeRApprox(reconPoint);
+    reconState[laserIdx].push(reconPoint, reconR);
+
+    const auto modeBits = fp::modeToBits(best.mode);
+    modeHist[best.mode]++;
+    familyHist[modeBits.familyBit]++;
+    if (modeBits.groupBits == 0b00)
+      groupHist[0]++;
+    else if (modeBits.groupBits == 0b01)
+      groupHist[1]++;
+    else if (modeBits.groupBits == 0b10)
+      groupHist[2]++;
+    else
+      throw std::runtime_error("flat predgeom: illegal encoded group bits");
+
+    for (int k = 0; k < 3; k++)
+      zeroHist[k] += bestResidualEncoded[k] == 0;
+    if (bestResidualEncoded[0] == 0 && bestResidualEncoded[1] == 0 && bestResidualEncoded[2] == 0)
+      qpZeroCount++;
+    totalL1 += bestL1;
+
+    dumpWriter.writeRow(
+      codedIdx, p, laserIdx, ctxGroup, modeRangeClass, modeBoundary,
+      residualRangeClass, residualBoundary, best.mode, modeBits, best.pred, curr,
+      bestResidualRecon, bestL1, reconPoint, best.predR, reconR);
 
     codedOrder[codedIdx] = p;
+    outCloud[codedIdx] = reconPoint;
+    if (cloud.hasLaserAngles())
+      outCloud.setLaserAngle(codedIdx, cloud.getLaserAngle(p));
+    if (cloud.hasColors())
+      outCloud.setColor(codedIdx, cloud.getColor(p));
+    if (cloud.hasReflectances())
+      outCloud.setReflectance(codedIdx, cloud.getReflectance(p));
     codedIdx++;
   }
+
   enc.encodeEndOfTreesFlag(true);
 
-  // save the context state for re-use by a future slice if required
   ctxtMem = enc.getCtx();
 
-  // Resize outCloud to match only the encoded points.
   outCloud.resize(codedIdx);
 
-  // put points in output cloud in coded order (identity in flat mode)
-  for (int i = 0; i < codedIdx; i++) {
-    auto srcIdx = codedOrder[i];
-    outCloud[i] = cloud[srcIdx];
-    if (cloud.hasLaserAngles())
-      outCloud.setLaserAngle(i, cloud.getLaserAngle(srcIdx));
-    if (cloud.hasColors())
-      outCloud.setColor(i, cloud.getColor(srcIdx));
-    if (cloud.hasReflectances())
-      outCloud.setReflectance(i, cloud.getReflectance(srcIdx));
-  }
+  std::cout << "  Flat predgeom stats:" << std::endl;
+  std::cout << "    Mode hist:";
+  for (int mode = 0; mode < fp::kCartesianPredModes; mode++)
+    std::cout << " m" << mode << "=" << modeHist[mode];
+  std::cout << std::endl;
+  std::cout << "    Mode family:";
+  for (int family = 0; family < 2; family++)
+    std::cout << " f" << family << "=" << familyHist[family];
+  std::cout << std::endl;
+  std::cout << "    Group bits: g00=" << groupHist[0] << " g01=" << groupHist[1]
+            << " g10=" << groupHist[2] << std::endl;
+  std::cout << "    Zero-rate:";
+  for (int k = 0; k < 3; k++)
+    std::cout << " " << char('x' + k) << "=" << std::fixed
+              << std::setprecision(3)
+              << (codedIdx ? double(zeroHist[k]) / codedIdx : 0.0);
+  std::cout << std::defaultfloat << std::endl;
+  std::cout << "    Avg L1: "
+            << (codedIdx ? double(totalL1) / codedIdx : 0.0) << std::endl;
+  std::cout << "    Fixed QP: " << fixedQp;
+  std::cout << " all-zero-residual-rate="
+            << std::fixed << std::setprecision(3)
+            << (codedIdx ? double(qpZeroCount) / codedIdx : 0.0)
+            << std::defaultfloat;
+  std::cout << std::endl;
 
   swap(cloud, outCloud);
 }
