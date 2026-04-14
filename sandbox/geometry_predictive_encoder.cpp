@@ -97,6 +97,26 @@ namespace {
       boundary ? 1 : 0};
   }
 
+  inline point_t
+  quantizeFlatResidual(const point_t& residual, int qp)
+  {
+    QuantizerGeom quantizer(qp);
+    point_t out = 0;
+    for (int k = 0; k < 3; ++k)
+      out[k] = int32_t(quantizer.quantize(residual[k]));
+    return out;
+  }
+
+  inline point_t
+  dequantizeFlatResidual(const point_t& qResidual, int qp)
+  {
+    QuantizerGeom quantizer(qp);
+    point_t out = 0;
+    for (int k = 0; k < 3; ++k)
+      out[k] = int32_t(quantizer.scale(qResidual[k]));
+    return out;
+  }
+
   class FlatPredGeomDumpWriter {
   public:
     explicit FlatPredGeomDumpWriter(const std::string& csvPath)
@@ -1794,6 +1814,8 @@ encodePredictiveGeometry(
   PredGeomContexts& ctxtMem,
   EntropyEncoder* arithmeticEncoder,
   int numGroups,
+  bool flatQresEnabled,
+  int flatFixedQp,
   const std::string& dumpCsvPath)
 {
   auto numPoints = cloud.getPointCount();
@@ -1819,7 +1841,10 @@ encodePredictiveGeometry(
   std::array<int64_t, 3> groupHist = {};
   std::array<int64_t, 2> familyHist = {};
   std::array<int64_t, 3> zeroHist = {};
+  int64_t qpZeroCount = 0;
   int64_t totalL1 = 0;
+  const bool qresQpEnabled = flatQresEnabled;
+  const int fixedQp = std::max(0, flatFixedQp);
 
   for (int p = 0; p < numPoints; p++) {
     const auto& curr = cloud[p];
@@ -1828,7 +1853,8 @@ encodePredictiveGeometry(
     const fp::ModeContextKey modeCtx = fp::deriveModeContext(reconState[laserIdx]);
 
     fp::Candidate best;
-    point_t bestResidual = 0;
+    point_t bestResidualEncoded = 0;
+    point_t bestResidualRecon = 0;
     int64_t bestL1 = std::numeric_limits<int64_t>::max();
 
     for (int mode = 0; mode < fp::kCartesianPredModes; mode++) {
@@ -1836,11 +1862,17 @@ encodePredictiveGeometry(
       if (!cand.valid)
         continue;
 
-      const point_t residual = curr - cand.pred;
-      const int64_t l1 = fp::residualL1(residual);
+      const point_t residualRaw = curr - cand.pred;
+      const point_t residualEncoded = qresQpEnabled
+        ? quantizeFlatResidual(residualRaw, fixedQp)
+        : residualRaw;
+      const int64_t l1 = fp::residualL1(residualEncoded);
       if (l1 < bestL1 || (l1 == bestL1 && mode < best.mode)) {
         best = cand;
-        bestResidual = residual;
+        bestResidualEncoded = residualEncoded;
+        bestResidualRecon = qresQpEnabled
+          ? dequantizeFlatResidual(residualEncoded, fixedQp)
+          : residualEncoded;
         bestL1 = l1;
       }
     }
@@ -1853,10 +1885,10 @@ encodePredictiveGeometry(
 
     const fp::ResidualContextKey residualCtx = fp::deriveResidualContext(best);
     enc.encodePredGeom(
-      bestResidual, ctxGroup, best.mode, residualCtx.rangeClass,
+      bestResidualEncoded, ctxGroup, best.mode, residualCtx.rangeClass,
       residualCtx.boundary);
 
-    const point_t reconPoint = best.pred + bestResidual;
+    const point_t reconPoint = best.pred + bestResidualRecon;
     const int reconR = fp::computeRApprox(reconPoint);
     reconState[laserIdx].push(reconPoint, reconR);
 
@@ -1873,15 +1905,24 @@ encodePredictiveGeometry(
       throw std::runtime_error("flat predgeom: illegal encoded group bits");
 
     for (int k = 0; k < 3; k++)
-      zeroHist[k] += bestResidual[k] == 0;
+      zeroHist[k] += bestResidualEncoded[k] == 0;
+    if (bestResidualEncoded[0] == 0 && bestResidualEncoded[1] == 0 && bestResidualEncoded[2] == 0)
+      qpZeroCount++;
     totalL1 += bestL1;
 
     dumpWriter.writeRow(
       codedIdx, p, laserIdx, ctxGroup, modeCtx.rangeClass, modeCtx.boundary,
       residualCtx.rangeClass, residualCtx.boundary, best.mode, modeBits, best.pred, curr,
-      bestResidual, bestL1, reconPoint, best.predR, reconR);
+      bestResidualRecon, bestL1, reconPoint, best.predR, reconR);
 
     codedOrder[codedIdx] = p;
+    outCloud[codedIdx] = reconPoint;
+    if (cloud.hasLaserAngles())
+      outCloud.setLaserAngle(codedIdx, cloud.getLaserAngle(p));
+    if (cloud.hasColors())
+      outCloud.setColor(codedIdx, cloud.getColor(p));
+    if (cloud.hasReflectances())
+      outCloud.setReflectance(codedIdx, cloud.getReflectance(p));
     codedIdx++;
   }
 
@@ -1890,17 +1931,6 @@ encodePredictiveGeometry(
   ctxtMem = enc.getCtx();
 
   outCloud.resize(codedIdx);
-
-  for (int i = 0; i < codedIdx; i++) {
-    auto srcIdx = codedOrder[i];
-    outCloud[i] = cloud[srcIdx];
-    if (cloud.hasLaserAngles())
-      outCloud.setLaserAngle(i, cloud.getLaserAngle(srcIdx));
-    if (cloud.hasColors())
-      outCloud.setColor(i, cloud.getColor(srcIdx));
-    if (cloud.hasReflectances())
-      outCloud.setReflectance(i, cloud.getReflectance(srcIdx));
-  }
 
   std::cout << "  Flat predgeom stats:" << std::endl;
   std::cout << "    Mode hist:";
@@ -1921,6 +1951,14 @@ encodePredictiveGeometry(
   std::cout << std::defaultfloat << std::endl;
   std::cout << "    Avg L1: "
             << (codedIdx ? double(totalL1) / codedIdx : 0.0) << std::endl;
+  if (qresQpEnabled) {
+    std::cout << "    Fixed QP: " << fixedQp;
+    std::cout << " all-zero-residual-rate="
+              << std::fixed << std::setprecision(3)
+              << (codedIdx ? double(qpZeroCount) / codedIdx : 0.0)
+              << std::defaultfloat;
+    std::cout << std::endl;
+  }
 
   swap(cloud, outCloud);
 }

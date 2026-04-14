@@ -64,6 +64,16 @@ namespace {
         0, std::min(flat_predgeom::kCartesianRangeClasses - 1, rangeClass)),
       boundary ? 1 : 0};
   }
+
+  inline point_t
+  dequantizeFlatResidual(const point_t& qResidual, int qp)
+  {
+    QuantizerGeom quantizer(qp);
+    point_t out = 0;
+    for (int k = 0; k < 3; ++k)
+      out[k] = int32_t(quantizer.scale(qResidual[k]));
+    return out;
+  }
 }  // namespace
 
 // Max ring groups for context array sizing (compile-time)
@@ -876,7 +886,9 @@ void decodePredictiveGeometry(
   PCCPointSet3& cloud,
   PredGeomContexts& ctxtMem,
   EntropyDecoder* arithmeticDecoder,
-  int numGroups)
+  int numGroups,
+  bool flatQresEnabled,
+  int flatFixedQp)
 {
   auto numPoints = gbh.footer.geom_num_points_minus1 + 1;
 
@@ -884,6 +896,8 @@ void decodePredictiveGeometry(
   cloud.resize(numPoints);
 
   PredGeomDecoder dec(gps, gbh, ctxtMem, arithmeticDecoder, numGroups);
+  const bool qresQpEnabled = flatQresEnabled;
+  const int fixedQp = std::max(0, flatFixedQp);
 
   std::array<fp::RingState, fp::kNumRings> reconState = {};
 
@@ -900,8 +914,11 @@ void decodePredictiveGeometry(
       throw std::runtime_error("flat predgeom: decoded invalid mode candidate");
 
     const fp::ResidualContextKey residualCtx = fp::deriveResidualContext(cand);
-    Vec3<int32_t> residual = dec.decodePredGeom(
+    Vec3<int32_t> residualEncoded = dec.decodePredGeom(
       ctxGroup, mode, residualCtx.rangeClass, residualCtx.boundary);
+    Vec3<int32_t> residual = qresQpEnabled
+      ? dequantizeFlatResidual(residualEncoded, fixedQp)
+      : residualEncoded;
     point_t reconPoint = cand.pred + residual;
 
     reconState[laserIdx].push(reconPoint, fp::computeRApprox(reconPoint));
