@@ -28,7 +28,6 @@ set(CMAKE_DEPENDS_DEPENDENCY_FILES
   "/home/swnh/gpcc/mpeg-pcc-tmc13/tmc3/geometry_octree.cpp" "sandbox/CMakeFiles/predgeom.dir/__/mpeg-pcc-tmc13/tmc3/geometry_octree.cpp.o" "gcc" "sandbox/CMakeFiles/predgeom.dir/__/mpeg-pcc-tmc13/tmc3/geometry_octree.cpp.o.d"
   "/home/swnh/gpcc/mpeg-pcc-tmc13/tmc3/geometry_octree_decoder.cpp" "sandbox/CMakeFiles/predgeom.dir/__/mpeg-pcc-tmc13/tmc3/geometry_octree_decoder.cpp.o" "gcc" "sandbox/CMakeFiles/predgeom.dir/__/mpeg-pcc-tmc13/tmc3/geometry_octree_decoder.cpp.o.d"
   "/home/swnh/gpcc/mpeg-pcc-tmc13/tmc3/geometry_octree_encoder.cpp" "sandbox/CMakeFiles/predgeom.dir/__/mpeg-pcc-tmc13/tmc3/geometry_octree_encoder.cpp.o" "gcc" "sandbox/CMakeFiles/predgeom.dir/__/mpeg-pcc-tmc13/tmc3/geometry_octree_encoder.cpp.o.d"
-  "/home/swnh/gpcc/mpeg-pcc-tmc13/tmc3/geometry_predictive_decoder.cpp" "sandbox/CMakeFiles/predgeom.dir/__/mpeg-pcc-tmc13/tmc3/geometry_predictive_decoder.cpp.o" "gcc" "sandbox/CMakeFiles/predgeom.dir/__/mpeg-pcc-tmc13/tmc3/geometry_predictive_decoder.cpp.o.d"
   "/home/swnh/gpcc/mpeg-pcc-tmc13/tmc3/geometry_trisoup_decoder.cpp" "sandbox/CMakeFiles/predgeom.dir/__/mpeg-pcc-tmc13/tmc3/geometry_trisoup_decoder.cpp.o" "gcc" "sandbox/CMakeFiles/predgeom.dir/__/mpeg-pcc-tmc13/tmc3/geometry_trisoup_decoder.cpp.o.d"
   "/home/swnh/gpcc/mpeg-pcc-tmc13/tmc3/geometry_trisoup_encoder.cpp" "sandbox/CMakeFiles/predgeom.dir/__/mpeg-pcc-tmc13/tmc3/geometry_trisoup_encoder.cpp.o" "gcc" "sandbox/CMakeFiles/predgeom.dir/__/mpeg-pcc-tmc13/tmc3/geometry_trisoup_encoder.cpp.o.d"
   "/home/swnh/gpcc/mpeg-pcc-tmc13/tmc3/io_hls.cpp" "sandbox/CMakeFiles/predgeom.dir/__/mpeg-pcc-tmc13/tmc3/io_hls.cpp.o" "gcc" "sandbox/CMakeFiles/predgeom.dir/__/mpeg-pcc-tmc13/tmc3/io_hls.cpp.o.d"
@@ -41,14 +40,19 @@ set(CMAKE_DEPENDS_DEPENDENCY_FILES
   "/home/swnh/gpcc/mpeg-pcc-tmc13/tmc3/pointset_processing.cpp" "sandbox/CMakeFiles/predgeom.dir/__/mpeg-pcc-tmc13/tmc3/pointset_processing.cpp.o" "gcc" "sandbox/CMakeFiles/predgeom.dir/__/mpeg-pcc-tmc13/tmc3/pointset_processing.cpp.o.d"
   "/home/swnh/gpcc/mpeg-pcc-tmc13/tmc3/quantization.cpp" "sandbox/CMakeFiles/predgeom.dir/__/mpeg-pcc-tmc13/tmc3/quantization.cpp.o" "gcc" "sandbox/CMakeFiles/predgeom.dir/__/mpeg-pcc-tmc13/tmc3/quantization.cpp.o.d"
   "/home/swnh/gpcc/mpeg-pcc-tmc13/tmc3/tables.cpp" "sandbox/CMakeFiles/predgeom.dir/__/mpeg-pcc-tmc13/tmc3/tables.cpp.o" "gcc" "sandbox/CMakeFiles/predgeom.dir/__/mpeg-pcc-tmc13/tmc3/tables.cpp.o.d"
+  "/home/swnh/gpcc/sandbox/geometry_predictive_decoder.cpp" "sandbox/CMakeFiles/predgeom.dir/geometry_predictive_decoder.cpp.o" "gcc" "sandbox/CMakeFiles/predgeom.dir/geometry_predictive_decoder.cpp.o.d"
   "/home/swnh/gpcc/sandbox/geometry_predictive_encoder.cpp" "sandbox/CMakeFiles/predgeom.dir/geometry_predictive_encoder.cpp.o" "gcc" "sandbox/CMakeFiles/predgeom.dir/geometry_predictive_encoder.cpp.o.d"
   "/home/swnh/gpcc/sandbox/main.cpp" "sandbox/CMakeFiles/predgeom.dir/main.cpp.o" "gcc" "sandbox/CMakeFiles/predgeom.dir/main.cpp.o.d"
   "/home/swnh/gpcc/sandbox/ply.cpp" "sandbox/CMakeFiles/predgeom.dir/ply.cpp.o" "gcc" "sandbox/CMakeFiles/predgeom.dir/ply.cpp.o.d"
   "/home/swnh/gpcc/build/sandbox/version.cpp" "sandbox/CMakeFiles/predgeom.dir/version.cpp.o" "gcc" "sandbox/CMakeFiles/predgeom.dir/version.cpp.o.d"
   )
 
-# Targets to which this target links.
-set(CMAKE_TARGET_LINKED_INFO_FILES
+# Targets to which this target links which contain Fortran sources.
+set(CMAKE_Fortran_TARGET_LINKED_INFO_FILES
+  )
+
+# Targets to which this target links which contain Fortran sources.
+set(CMAKE_Fortran_TARGET_FORWARD_LINKED_INFO_FILES
   )
 
 # Fortran module output directory.

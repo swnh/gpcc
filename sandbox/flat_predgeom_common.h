@@ -18,15 +18,20 @@ static const int kCartesianRangeClasses = 3;
 static const int kCartesianBoundaryClasses = 2;
 static const int kCartesianPredModes = 6;
 static const int kCartesianPredFamilies = 2;
+// Packed mode tree nodes per (group, range, boundary):
+//   0: family
+//   1..2: groupBit1 conditioned by family
+//   3..4: groupBit0 conditioned by family, coded only when groupBit1 == 0
+static const int kCartesianPredModeTreeNodes = 5;
 
 // Mode mapping table for fixed 3-bit mode header:
 //   mode id | family bit | group bits | semantic
 //      0    |     0      |    00      | Zero
 //      1    |     0      |    01      | SameRingLast
-//      2    |     0      |    11      | SameRingLinear2
+//      2    |     0      |    10      | SameRingLinear2
 //      3    |     1      |    00      | CrossRingUp
 //      4    |     1      |    01      | CrossRingDown
-//      5    |     1      |    11      | SameRingHist1 (legacy histIdx=1 folded into mode)
+//      5    |     1      |    10      | SameRingHist1 (legacy histIdx=1 folded into mode)
 enum CartesianPredMode
 {
   kPredZero = 0,
@@ -143,13 +148,13 @@ modeToBits(int mode)
   case kPredSameRingLast:
     return {0, 0b01};
   case kPredSameRingLinear2:
-    return {0, 0b11};
+    return {0, 0b10};
   case kPredCrossRingUp:
     return {1, 0b00};
   case kPredCrossRingDown:
     return {1, 0b01};
   case kPredSameRingHist1:
-    return {1, 0b11};
+    return {1, 0b10};
   default:
     throw std::runtime_error("flat predgeom: invalid mode id");
   }
@@ -158,8 +163,8 @@ modeToBits(int mode)
 inline int
 bitsToMode(int familyBit, int groupBits)
 {
-  if (groupBits == 0b10)
-    throw std::runtime_error("flat predgeom: illegal group bits 10");
+  if (groupBits == 0b11)
+    throw std::runtime_error("flat predgeom: illegal group bits 11");
 
   if (!familyBit) {
     if (groupBits == 0b00)
@@ -177,8 +182,27 @@ bitsToMode(int familyBit, int groupBits)
 }
 
 inline int
-ctxGroupForLaser(int numGroups, int laserIdx)
+modeTreeNodeFamily()
 {
+  return 0;
+}
+
+inline int
+modeTreeNodeGroupBit1(int familyBit)
+{
+  return 1 + familyBit;
+}
+
+inline int
+modeTreeNodeGroupBit0(int familyBit, int groupBit1)
+{
+  (void)groupBit1;
+  return 3 + familyBit;
+}
+
+inline int
+ctxGroupForLaser(int numGroups, int laserIdx)
+{ 
   const int ringsPerGroup = std::max(1, kNumRings / numGroups);
   return std::min(numGroups - 1, std::max(0, laserIdx / ringsPerGroup));
 }

@@ -179,12 +179,8 @@ private:
                              [fp::kCartesianBoundaryClasses][fp::kCartesianPredFamilies][3];
   AdaptiveBitModel _ctxNumBits_g[kMaxRingGroups][fp::kCartesianRangeClasses]
                                 [fp::kCartesianBoundaryClasses][8][3][31];
-  AdaptiveBitModel _ctxModeFamily_g[kMaxRingGroups][fp::kCartesianRangeClasses]
-                                   [fp::kCartesianBoundaryClasses];
-  AdaptiveBitModel _ctxModeGroupBit1_g[kMaxRingGroups][fp::kCartesianRangeClasses]
-                                      [fp::kCartesianBoundaryClasses][fp::kCartesianPredFamilies];
-  AdaptiveBitModel _ctxModeGroupBit0_g[kMaxRingGroups][fp::kCartesianRangeClasses]
-                                      [fp::kCartesianBoundaryClasses][fp::kCartesianPredFamilies][2];
+  AdaptiveBitModel _ctxPredMode_g[kMaxRingGroups][fp::kCartesianRangeClasses]
+                                 [fp::kCartesianBoundaryClasses][fp::kCartesianPredModeTreeNodes];
 };
 
 //============================================================================
@@ -786,13 +782,18 @@ int
 PredGeomDecoder::decodeModeHeader(int group, int rangeClass, bool boundary)
 {
   const auto ctx = makeFlatCtxAddr(group, rangeClass, boundary);
-  const int familyBit =
-    _aed->decode(_ctxModeFamily_g[ctx.ringGroup][ctx.rangeClass][ctx.boundaryClass]);
+  const int familyBit = _aed->decode(
+    _ctxPredMode_g[ctx.ringGroup][ctx.rangeClass][ctx.boundaryClass]
+                  [fp::modeTreeNodeFamily()]);
   const int groupBit1 = _aed->decode(
-    _ctxModeGroupBit1_g[ctx.ringGroup][ctx.rangeClass][ctx.boundaryClass][familyBit]);
-  const int groupBit0 =
-    _aed->decode(_ctxModeGroupBit0_g[ctx.ringGroup][ctx.rangeClass][ctx.boundaryClass]
-                                  [familyBit][groupBit1]);
+    _ctxPredMode_g[ctx.ringGroup][ctx.rangeClass][ctx.boundaryClass]
+                  [fp::modeTreeNodeGroupBit1(familyBit)]);
+  int groupBit0 = 0;
+  if (!groupBit1) {
+    groupBit0 = _aed->decode(
+      _ctxPredMode_g[ctx.ringGroup][ctx.rangeClass][ctx.boundaryClass]
+                    [fp::modeTreeNodeGroupBit0(familyBit, groupBit1)]);
+  }
   return fp::bitsToMode(familyBit, (groupBit1 << 1) | groupBit0);
 }
 
@@ -824,7 +825,7 @@ PredGeomDecoder::decodePredGeom(
       bitlenNode = (bitlenNode << 1) | bin;
     }
 
-    magnitudeCtx = std::min(7, (numBits + 1) >> 1);
+    magnitudeCtx = std::min(4, (numBits + 1) >> 1);
 
     int32_t value = 0;
     int32_t numBitsExtra = numBits - 1;
@@ -890,7 +891,7 @@ void decodePredictiveGeometry(
     const int laserIdx = fp::clampLaserIdx(cloud, p);
 
     const fp::ModeContextKey modeCtx = fp::deriveModeContext(reconState[laserIdx]);
-    const int ctxGroup = fp::ctxGroupForLaser(numGroups, laserIdx);
+    const int ctxGroup = (laserIdx > 15) ? 1 : 0;/*fp::ctxGroupForLaser(numGroups, laserIdx);*/
     const int mode = dec.decodeModeHeader(
       ctxGroup, modeCtx.rangeClass, modeCtx.boundary);
 

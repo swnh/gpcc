@@ -314,12 +314,8 @@ private:
                              [fp::kCartesianBoundaryClasses][fp::kCartesianPredFamilies][3];
   AdaptiveBitModel _ctxNumBits_g[kMaxRingGroups][fp::kCartesianRangeClasses]
                                 [fp::kCartesianBoundaryClasses][8][3][31];
-  AdaptiveBitModel _ctxModeFamily_g[kMaxRingGroups][fp::kCartesianRangeClasses]
-                                   [fp::kCartesianBoundaryClasses];
-  AdaptiveBitModel _ctxModeGroupBit1_g[kMaxRingGroups][fp::kCartesianRangeClasses]
-                                      [fp::kCartesianBoundaryClasses][fp::kCartesianPredFamilies];
-  AdaptiveBitModel _ctxModeGroupBit0_g[kMaxRingGroups][fp::kCartesianRangeClasses]
-                                      [fp::kCartesianBoundaryClasses][fp::kCartesianPredFamilies][2];
+  AdaptiveBitModel _ctxPredMode_g[kMaxRingGroups][fp::kCartesianRangeClasses]
+                                 [fp::kCartesianBoundaryClasses][fp::kCartesianPredModeTreeNodes];
 };
 
 //============================================================================
@@ -1724,14 +1720,21 @@ PredGeomEncoder::encodeModeHeader(int mode, int group, int rangeClass, bool boun
   const int groupBit1 = (bits.groupBits >> 1) & 1;
   const int groupBit0 = bits.groupBits & 1;
 
-  _aec->encode(bits.familyBit, _ctxModeFamily_g[ctx.ringGroup][ctx.rangeClass][ctx.boundaryClass]);
+  _aec->encode(
+    bits.familyBit,
+    _ctxPredMode_g[ctx.ringGroup][ctx.rangeClass][ctx.boundaryClass]
+                  [fp::modeTreeNodeFamily()]);
   _aec->encode(
     groupBit1,
-    _ctxModeGroupBit1_g[ctx.ringGroup][ctx.rangeClass][ctx.boundaryClass][bits.familyBit]);
-  _aec->encode(
-    groupBit0,
-    _ctxModeGroupBit0_g[ctx.ringGroup][ctx.rangeClass][ctx.boundaryClass][bits.familyBit]
-                         [groupBit1]);
+    _ctxPredMode_g[ctx.ringGroup][ctx.rangeClass][ctx.boundaryClass]
+                  [fp::modeTreeNodeGroupBit1(bits.familyBit)]);
+
+  if (!groupBit1) {
+    _aec->encode(
+      groupBit0,
+      _ctxPredMode_g[ctx.ringGroup][ctx.rangeClass][ctx.boundaryClass]
+                    [fp::modeTreeNodeGroupBit0(bits.familyBit, groupBit1)]);
+  }
 }
 
 void
@@ -1768,7 +1771,7 @@ PredGeomEncoder::encodePredGeom(
       bitlenNode = (bitlenNode << 1) | bin;
     }
 
-    magnitudeCtx = std::min(7, (numBits + 1) >> 1);
+    magnitudeCtx = std::min(4, (numBits + 1) >> 1);
 
     --numBits;
     for (int32_t i = 0; i < numBits; ++i)
@@ -1845,7 +1848,7 @@ encodePredictiveGeometry(
     if (bestL1 == std::numeric_limits<int64_t>::max())
       throw std::runtime_error("flat predgeom: no valid mode candidate");
 
-    const int ctxGroup = fp::ctxGroupForLaser(numGroups, laserIdx);
+    const int ctxGroup = (laserIdx > 15) ? 1 : 0;/*fp::ctxGroupForLaser(numGroups, laserIdx);*/
     enc.encodeModeHeader(best.mode, ctxGroup, modeCtx.rangeClass, modeCtx.boundary);
 
     const fp::ResidualContextKey residualCtx = fp::deriveResidualContext(best);
@@ -1864,8 +1867,10 @@ encodePredictiveGeometry(
       groupHist[0]++;
     else if (modeBits.groupBits == 0b01)
       groupHist[1]++;
-    else
+    else if (modeBits.groupBits == 0b10)
       groupHist[2]++;
+    else
+      throw std::runtime_error("flat predgeom: illegal encoded group bits");
 
     for (int k = 0; k < 3; k++)
       zeroHist[k] += bestResidual[k] == 0;
@@ -1907,7 +1912,7 @@ encodePredictiveGeometry(
     std::cout << " f" << family << "=" << familyHist[family];
   std::cout << std::endl;
   std::cout << "    Group bits: g00=" << groupHist[0] << " g01=" << groupHist[1]
-            << " g11=" << groupHist[2] << std::endl;
+            << " g10=" << groupHist[2] << std::endl;
   std::cout << "    Zero-rate:";
   for (int k = 0; k < 3; k++)
     std::cout << " " << char('x' + k) << "=" << std::fixed
