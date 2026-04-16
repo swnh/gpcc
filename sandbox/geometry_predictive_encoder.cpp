@@ -258,6 +258,13 @@ public:
   void encodeFlatFixedQp(int qp);
   void encodeEndOfTreesFlag(int endFlag);
 
+  // ---- Angular grid coding (encodePredictiveGeometryAngular) ----
+  void encodeAngularElevStep(int32_t dRing);
+  void encodeAngularColStep(int32_t dColumn);
+  void encodeAngularPredIdx(int idx);
+  void encodeAngularRadius(int32_t dr);
+  void encodeAngularAzimuth(int32_t dAz);
+
 
   template<size_t NumPrefixCtx, size_t NumSuffixCtx>
   inline float
@@ -321,6 +328,22 @@ private:
 
   // Minimum radius used for prediction in angular coding
   int _pgeom_min_radius;
+
+  // ---- Angular grid coding contexts (encodePredictiveGeometryAngular) ----
+  AdaptiveBitModel _ctxAngElevGt0;
+  AdaptiveBitModel _ctxAngElevSign;
+  AdaptiveBitModel _ctxAngElevEgl;
+  AdaptiveBitModel _ctxAngColGt0;
+  AdaptiveBitModel _ctxAngColSign;
+  AdaptiveBitModel _ctxAngColEgl;
+  AdaptiveBitModel _ctxAngPredIdx[3];
+  AdaptiveBitModel _ctxAngRadiusGt0;
+  AdaptiveBitModel _ctxAngRadiusGt1;
+  AdaptiveBitModel _ctxAngRadiusSign;
+  AdaptiveBitModel _ctxAngRadiusEgl;
+  AdaptiveBitModel _ctxAngAzimuthGt0;
+  AdaptiveBitModel _ctxAngAzimuthSign;
+  AdaptiveBitModel _ctxAngAzimuthEgl;
 
   int _maxPredIdx;
   int _maxPredIdxTested;
@@ -1964,5 +1987,197 @@ encodePredictiveGeometry(
 }
 
 
+// ============================================================================
+// Angular grid coding methods
+// ============================================================================
+
+void
+PredGeomEncoder::encodeAngularElevStep(int32_t v)
+{
+  _aec->encode(v != 0, _ctxAngElevGt0);
+  if (!v) return;
+  _aec->encodeExpGolomb(std::abs(v) - 1, 0, _ctxAngElevEgl);
+  _aec->encode(v < 0, _ctxAngElevSign);
+}
+
+void
+PredGeomEncoder::encodeAngularColStep(int32_t v)
+{
+  _aec->encode(v != 0, _ctxAngColGt0);
+  if (!v) return;
+  _aec->encodeExpGolomb(std::abs(v) - 1, 0, _ctxAngColEgl);
+  _aec->encode(v < 0, _ctxAngColSign);
+}
+
+void
+PredGeomEncoder::encodeAngularPredIdx(int idx)
+{
+  for (int i = 0; i < idx; i++)
+    _aec->encode(1, _ctxAngPredIdx[std::min(i, 2)]);
+  if (idx < 3)
+    _aec->encode(0, _ctxAngPredIdx[std::min(idx, 2)]);
+}
+
+void
+PredGeomEncoder::encodeAngularRadius(int32_t v)
+{
+  _aec->encode(v != 0, _ctxAngRadiusGt0);
+  if (!v) return;
+  int32_t absVal = std::abs(v);
+  _aec->encode(--absVal > 0, _ctxAngRadiusGt1);
+  if (absVal)
+    _aec->encodeExpGolomb(absVal - 1, 0, _ctxAngRadiusEgl);
+  _aec->encode(v < 0, _ctxAngRadiusSign);
+}
+
+void
+PredGeomEncoder::encodeAngularAzimuth(int32_t v)
+{
+  _aec->encode(v != 0, _ctxAngAzimuthGt0);
+  if (!v) return;
+  _aec->encodeExpGolomb(std::abs(v) - 1, 0, _ctxAngAzimuthEgl);
+  _aec->encode(v < 0, _ctxAngAzimuthSign);
+}
+
+// ============================================================================
+void
+encodePredictiveGeometryAngular(
+  const PredGeomEncOpts& opt,
+  const GeometryParameterSet& gps,
+  GeometryBrickHeader& gbh,
+  PCCPointSet3& cloud,
+  PredGeomContexts& ctxtMem,
+  EntropyEncoder* arithmeticEncoder,
+  double qpInt)
+{
+  auto numPoints = cloud.getPointCount();
+  const int32_t log2ScaleRadius = gps.geom_angular_radius_inv_scale_log2;
+  const int32_t scalePhi = 1 << (gps.geom_angular_azimuth_scale_log2_minus11 + 12);
+  const int32_t maxPtsPerRot = 1090;  // Velodyne HDL-32E horizontal resolution
+
+  PCCPointSet3 outCloud;
+  outCloud.addRemoveAttributes(cloud.hasColors(), cloud.hasReflectances());
+  if (cloud.hasLaserAngles())
+    outCloud.addLaserAngles();
+  outCloud.resize(numPoints);
+
+  for (int k = 0; k < 3; k++)
+    gbh.pgeom_resid_abs_log2_bits[k] = 5;
+
+  PredGeomEncoder enc(gps, gbh, opt, ctxtMem, arithmeticEncoder);
+  SphericalToCartesian sphToCart(gps);
+  const Vec3<int32_t> origin = gbh.geomAngularOrigin(gps);
+
+  // Per-ring state: last 4 r values, last azimuth shift, last column index
+  std::array<std::array<int32_t, 4>, fp::kNumRings> radiusList = {};
+  std::array<int32_t, fp::kNumRings> azimuthList = {};
+  std::array<int32_t, fp::kNumRings> prevColumn = {};
+  int prevRing = 0;
+
+  for (int p = 0; p < numPoints; p++) {
+    const auto& xyz = cloud[p];
+    const int thetaIdx = fp::clampLaserIdx(cloud, p);
+
+    // Cartesian → spherical (manual, ring from metadata)
+    int64_t r0 = int64_t(std::round(std::hypot(double(xyz[0]), double(xyz[1]))));
+    int32_t sphR = int32_t(divExp2RoundHalfUp(r0, log2ScaleRadius));
+    int32_t phi = int32_t(std::round(
+      std::atan2(double(xyz[1]), double(xyz[0])) / (2.0 * M_PI) * scalePhi));
+
+    // Column assignment: map phi to scan-position index [0, maxPtsPerRot)
+    int32_t phiShifted = phi + scalePhi / 2;  // shift [-S/2, S/2) → [0, S)
+    int32_t column = int32_t((int64_t)phiShifted * maxPtsPerRot / scalePhi);
+    column = std::max(0, std::min(maxPtsPerRot - 1, column));
+    int32_t azimuthShift = phiShifted
+      - int32_t((int64_t)column * scalePhi / maxPtsPerRot);
+
+    // Occupancy map: ring step + azimuth column step
+    int32_t dRing   = thetaIdx - prevRing;
+    int32_t dColumn = column - prevColumn[thetaIdx];
+    enc.encodeAngularElevStep(dRing);
+    enc.encodeAngularColStep(dColumn);
+
+    // 4 prediction candidates for sphR
+    const auto& rl = radiusList[thetaIdx];
+    int32_t cand0 = rl[0];
+    int32_t cand1 = rl[3];
+    int32_t cand2 = (rl[0] + rl[1]) / 2;
+    int32_t cand3 = (thetaIdx > 0)
+      ? radiusList[thetaIdx - 1][0]
+      : (thetaIdx + 1 < fp::kNumRings ? radiusList[thetaIdx + 1][0] : rl[0]);
+    int32_t cands[4] = {cand0, cand1, cand2, cand3};
+
+    int bestIdx = 0;
+    int32_t bestErr = std::abs(sphR - cands[0]);
+    for (int i = 1; i < 4; i++) {
+      int32_t err = std::abs(sphR - cands[i]);
+      if (err < bestErr) { bestErr = err; bestIdx = i; }
+    }
+
+    int32_t dr  = sphR - cands[bestIdx];
+    int32_t dAz = azimuthShift - azimuthList[thetaIdx];
+
+    // Quantization
+    // QP_int = qpInt mm (= 2^flat_qp; sphR unit = mm when log2ScaleRadius=0)
+    // QS_r adjusted for scan azimuth direction; QS_az converts mm step → phi units
+    const double phi_rad =
+      double(column) * (2.0 * M_PI) / double(maxPtsPerRot);
+    const double cos_sin =
+      std::abs(std::cos(phi_rad)) + std::abs(std::sin(phi_rad));
+    const double QS_r = qpInt / std::max(cos_sin, 1e-6);
+
+    int32_t quantized_dr, recon_dr;
+    if (QS_r >= 0.5) {
+      quantized_dr = int32_t(std::round(double(dr) / QS_r));
+      recon_dr     = int32_t(std::round(double(quantized_dr) * QS_r));
+    } else {
+      quantized_dr = dr;
+      recon_dr     = dr;
+    }
+    const int32_t reconR = cands[bestIdx] + recon_dr;
+
+    const double QS_az = (reconR > 0)
+      ? QS_r * double(scalePhi) / (2.0 * M_PI * double(reconR))
+      : 0.0;
+
+    int32_t quantized_dAz, recon_dAz;
+    if (QS_az >= 0.5) {
+      quantized_dAz = int32_t(std::round(double(dAz) / QS_az));
+      recon_dAz     = int32_t(std::round(double(quantized_dAz) * QS_az));
+    } else {
+      quantized_dAz = dAz;
+      recon_dAz     = dAz;
+    }
+
+    enc.encodeAngularPredIdx(bestIdx);
+    enc.encodeAngularRadius(quantized_dr);
+    enc.encodeAngularAzimuth(quantized_dAz);
+
+    // Reconstruct from dequantized values (identical formula used in decoder)
+    int32_t reconAz  = azimuthList[thetaIdx] + recon_dAz;
+    int32_t reconCol = prevColumn[thetaIdx] + dColumn;
+    int32_t reconPhi = int32_t((int64_t)reconCol * scalePhi / maxPtsPerRot)
+                     + reconAz - scalePhi / 2;
+    outCloud[p] = origin + sphToCart({reconR, reconPhi, thetaIdx});
+
+    if (cloud.hasLaserAngles())
+      outCloud.setLaserAngle(p, cloud.getLaserAngle(p));
+    if (cloud.hasColors())
+      outCloud.setColor(p, cloud.getColor(p));
+    if (cloud.hasReflectances())
+      outCloud.setReflectance(p, cloud.getReflectance(p));
+
+    // Update state (dequantized values)
+    for (int i = 3; i > 0; i--) radiusList[thetaIdx][i] = radiusList[thetaIdx][i - 1];
+    radiusList[thetaIdx][0] = reconR;
+    azimuthList[thetaIdx]   = reconAz;
+    prevColumn[thetaIdx]    = reconCol;
+    prevRing = thetaIdx;
+  }
+
+  enc.encodeEndOfTreesFlag(true);
+  ctxtMem = enc.getCtx();
+  swap(cloud, outCloud);
+}
 // ============================================================================
 }  // namespace pcc

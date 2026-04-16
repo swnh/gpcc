@@ -111,12 +111,15 @@ clampLaserIdx(const PCCPointSet3& cloud, int idx)
   return std::max(0, std::min(kNumRings - 1, cloud.getLaserAngle(idx)));
 }
 
-inline int
-computeRApprox(const point_t& pt)
+inline uint32_t computeRApprox(const point_t& pt)
 {
-  const auto absX = std::abs(pt[0]);
-  const auto absY = std::abs(pt[1]);
-  return std::max(absX, absY) + ((424 * std::min(absX, absY)) >> 10);
+    const uint32_t ax = (pt[0] < 0) ? uint32_t(-pt[0]) : uint32_t(pt[0]);
+    const uint32_t ay = (pt[1] < 0) ? uint32_t(-pt[1]) : uint32_t(pt[1]);
+
+    const uint32_t maxv = (ax > ay) ? ax : ay;
+    const uint32_t minv = (ax > ay) ? ay : ax;
+
+    return maxv + (((minv << 5) + (minv << 4) + (minv << 2) + minv) >> 7);
 }
 
 inline int

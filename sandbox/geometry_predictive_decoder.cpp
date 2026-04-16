@@ -119,6 +119,13 @@ public:
   bool decodeEndOfTreesFlag();
   //==================================================
 
+  // ---- Angular grid coding (decodePredictiveGeometryAngular) ----
+  int32_t decodeAngularElevStep();
+  int32_t decodeAngularColStep();
+  int decodeAngularPredIdx();
+  int32_t decodeAngularRadius();
+  int32_t decodeAngularAzimuth();
+
 private:
   int decodeNumDuplicatePoints();
   int decodeNumChildren();
@@ -192,6 +199,22 @@ private:
                                 [fp::kCartesianBoundaryClasses][8][3][31];
   AdaptiveBitModel _ctxPredMode_g[kMaxRingGroups][fp::kCartesianRangeClasses]
                                  [fp::kCartesianBoundaryClasses][fp::kCartesianPredModeTreeNodes];
+
+  // ---- Angular grid coding contexts (decodePredictiveGeometryAngular) ----
+  AdaptiveBitModel _ctxAngElevGt0;
+  AdaptiveBitModel _ctxAngElevSign;
+  AdaptiveBitModel _ctxAngElevEgl;
+  AdaptiveBitModel _ctxAngColGt0;
+  AdaptiveBitModel _ctxAngColSign;
+  AdaptiveBitModel _ctxAngColEgl;
+  AdaptiveBitModel _ctxAngPredIdx[3];
+  AdaptiveBitModel _ctxAngRadiusGt0;
+  AdaptiveBitModel _ctxAngRadiusGt1;
+  AdaptiveBitModel _ctxAngRadiusSign;
+  AdaptiveBitModel _ctxAngRadiusEgl;
+  AdaptiveBitModel _ctxAngAzimuthGt0;
+  AdaptiveBitModel _ctxAngAzimuthSign;
+  AdaptiveBitModel _ctxAngAzimuthEgl;
 };
 
 //============================================================================
@@ -934,6 +957,138 @@ void decodePredictiveGeometry(
   while (!dec.decodeEndOfTreesFlag()) {
   }
 
+  ctxtMem = dec.getCtx();
+}
+
+//============================================================================
+// Angular grid decoding methods
+//============================================================================
+
+int32_t
+PredGeomDecoder::decodeAngularElevStep()
+{
+  if (!_aed->decode(_ctxAngElevGt0)) return 0;
+  int32_t absVal = int32_t(_aed->decodeExpGolomb(0, _ctxAngElevEgl)) + 1;
+  return _aed->decode(_ctxAngElevSign) ? -absVal : absVal;
+}
+
+int32_t
+PredGeomDecoder::decodeAngularColStep()
+{
+  if (!_aed->decode(_ctxAngColGt0)) return 0;
+  int32_t absVal = int32_t(_aed->decodeExpGolomb(0, _ctxAngColEgl)) + 1;
+  return _aed->decode(_ctxAngColSign) ? -absVal : absVal;
+}
+
+int
+PredGeomDecoder::decodeAngularPredIdx()
+{
+  int idx = 0;
+  while (idx < 3 && _aed->decode(_ctxAngPredIdx[idx]))
+    idx++;
+  return idx;
+}
+
+int32_t
+PredGeomDecoder::decodeAngularRadius()
+{
+  if (!_aed->decode(_ctxAngRadiusGt0)) return 0;
+  bool gt1 = _aed->decode(_ctxAngRadiusGt1);
+  int32_t absVal;
+  if (!gt1)
+    absVal = 1;
+  else
+    absVal = int32_t(_aed->decodeExpGolomb(0, _ctxAngRadiusEgl)) + 2;
+  return _aed->decode(_ctxAngRadiusSign) ? -absVal : absVal;
+}
+
+int32_t
+PredGeomDecoder::decodeAngularAzimuth()
+{
+  if (!_aed->decode(_ctxAngAzimuthGt0)) return 0;
+  int32_t absVal = int32_t(_aed->decodeExpGolomb(0, _ctxAngAzimuthEgl)) + 1;
+  return _aed->decode(_ctxAngAzimuthSign) ? -absVal : absVal;
+}
+
+//============================================================================
+
+void
+decodePredictiveGeometryAngular(
+  const GeometryParameterSet& gps,
+  const GeometryBrickHeader& gbh,
+  PCCPointSet3& cloud,
+  PredGeomContexts& ctxtMem,
+  EntropyDecoder* arithmeticDecoder,
+  double qpInt)
+{
+  auto numPoints = gbh.footer.geom_num_points_minus1 + 1;
+  cloud.resize(numPoints);
+
+  PredGeomDecoder dec(gps, gbh, ctxtMem, arithmeticDecoder);
+  SphericalToCartesian sphToCart(gps);
+  const Vec3<int32_t> origin = gbh.geomAngularOrigin(gps);
+  const int32_t scalePhi = 1 << (gps.geom_angular_azimuth_scale_log2_minus11 + 12);
+  const int32_t maxPtsPerRot = 1090;  // Velodyne HDL-32E horizontal resolution
+
+  // Same state arrays as encoder (must stay in sync)
+  std::array<std::array<int32_t, 4>, fp::kNumRings> radiusList = {};
+  std::array<int32_t, fp::kNumRings> azimuthList = {};
+  std::array<int32_t, fp::kNumRings> prevColumn = {};
+  int prevRing = 0;
+
+  for (int p = 0; p < numPoints; p++) {
+    // Decode occupancy: ring step + column step
+    const int32_t dRing = dec.decodeAngularElevStep();
+    const int ring = std::max(0,
+      std::min(fp::kNumRings - 1, prevRing + dRing));
+    const int32_t dColumn = dec.decodeAngularColStep();
+
+    // Build same 4 prediction candidates
+    const auto& rl = radiusList[ring];
+    int32_t cand0 = rl[0];
+    int32_t cand1 = rl[3];
+    int32_t cand2 = (rl[0] + rl[1]) / 2;
+    int32_t cand3 = (ring > 0)
+      ? radiusList[ring - 1][0]
+      : (ring + 1 < fp::kNumRings ? radiusList[ring + 1][0] : rl[0]);
+    int32_t cands[4] = {cand0, cand1, cand2, cand3};
+
+    const int predIdx       = dec.decodeAngularPredIdx();
+    const int32_t quantized_dr  = dec.decodeAngularRadius();
+    const int32_t quantized_dAz = dec.decodeAngularAzimuth();
+
+    // Dequantization (identical formula to encoder)
+    const int32_t reconCol = prevColumn[ring] + dColumn;
+    const double phi_rad =
+      double(reconCol) * (2.0 * M_PI) / double(maxPtsPerRot);
+    const double cos_sin =
+      std::abs(std::cos(phi_rad)) + std::abs(std::sin(phi_rad));
+    const double QS_r = qpInt / std::max(cos_sin, 1e-6);
+
+    const int32_t recon_dr = (QS_r >= 0.5)
+      ? int32_t(std::round(double(quantized_dr) * QS_r)) : quantized_dr;
+    const int32_t reconR = cands[predIdx] + recon_dr;
+
+    const double QS_az = (reconR > 0)
+      ? QS_r * double(scalePhi) / (2.0 * M_PI * double(reconR))
+      : 0.0;
+    const int32_t recon_dAz = (QS_az >= 0.5)
+      ? int32_t(std::round(double(quantized_dAz) * QS_az)) : quantized_dAz;
+
+    int32_t reconAz  = azimuthList[ring] + recon_dAz;
+    int32_t reconPhi = int32_t((int64_t)reconCol * scalePhi / maxPtsPerRot)
+                     + reconAz - scalePhi / 2;
+    cloud[p] = origin + sphToCart({reconR, reconPhi, ring});
+
+    // Update state (dequantized values)
+    for (int i = 3; i > 0; i--) radiusList[ring][i] = radiusList[ring][i - 1];
+    radiusList[ring][0] = reconR;
+    azimuthList[ring]   = reconAz;
+    prevColumn[ring]    = reconCol;
+    prevRing = ring;
+  }
+
+  while (!dec.decodeEndOfTreesFlag()) {}
   ctxtMem = dec.getCtx();
 }
 

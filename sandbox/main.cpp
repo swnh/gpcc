@@ -53,6 +53,7 @@ struct SimpleParams {
   int    flatQp = -1;                           // --flat-qp
   bool   rangeCtxEnabled = true;                // --range-ctx
   bool   boundaryCtxEnabled = true;             // --boundary-ctx
+  bool   angularMode = false;                   // --angular
 };
 
 // ============================================================================
@@ -60,6 +61,23 @@ struct SimpleParams {
 // geometry_predictive_encoder.cpp (ring-based, no tree, no inter)
 // ============================================================================
 namespace pcc {
+void encodePredictiveGeometryAngular(
+  const PredGeomEncOpts&,
+  const GeometryParameterSet&,
+  GeometryBrickHeader&,
+  PCCPointSet3&,
+  PredGeomContexts&,
+  EntropyEncoder*,
+  double qpInt);
+
+void decodePredictiveGeometryAngular(
+  const GeometryParameterSet&,
+  const GeometryBrickHeader&,
+  PCCPointSet3&,
+  PredGeomContexts&,
+  EntropyDecoder*,
+  double qpInt);
+
 void encodePredictiveGeometry(
   const PredGeomEncOpts& opt,
   const GeometryParameterSet& gps,
@@ -95,7 +113,7 @@ parseSimpleArgs(int argc, char* argv[], SimpleParams& p)
          << " [--scale <inputScale>] [--groups <1|2|4|8|16|32>]"
          << " [--dump-csv <context.csv>]"
          << " [--flat-qp <int>] [--range <0|1>] [--boundary <0|1>]"
-         << " [--summary-csv <summary.csv>]\n";
+         << " [--summary-csv <summary.csv>] [--angular]\n";
     return false;
   }
   for (int i = 1; i < argc; i++) {
@@ -122,6 +140,8 @@ parseSimpleArgs(int argc, char* argv[], SimpleParams& p)
       p.rangeCtxEnabled = atoi(argv[++i]) != 0;
     else if (arg == "--boundary" && i + 1 < argc)
       p.boundaryCtxEnabled = atoi(argv[++i]) != 0;
+    else if (arg == "--angular")
+      p.angularMode = true;
     else {
       cerr << "Unknown option: " << arg << "\n";
       return false;
@@ -215,6 +235,34 @@ setupMinimalGPS(GeometryParameterSet& gps)
   gps.geom_planar_mode_enabled_flag = false;
   gps.bitwise_occupancy_coding_flag = true;
   gps.octree_point_count_list_present_flag = false;
+}
+
+static void
+setupAngularGPS(GeometryParameterSet& gps)
+{
+  gps.geom_angular_mode_enabled_flag = true;
+  gps.azimuth_scaling_enabled_flag   = false;
+  gps.geom_angular_azimuth_scale_log2_minus11 = 7;  // scalePhi = 2^19 = 524288
+  gps.geom_angular_radius_inv_scale_log2      = 0;  // sphR = raw internal units (mm)
+  gps.geom_angular_azimuth_speed_minus1       = 0;
+  gps.geom_slice_angular_origin_present_flag  = false;
+  gps.gpsAngularOrigin = 0;
+
+  // Velodyne HDL-32E: 32 rings, -30.67° to +10.67°, ~1.33° steps
+  // angularTheta[i] = round(tan(elev_i * pi/180) * 2^18)
+  static const double elevDeg[32] = {
+    -30.67, -29.33, -28.00, -26.67, -25.33, -24.00, -22.67, -21.33,
+    -20.00, -18.67, -17.33, -16.00, -14.67, -13.33, -12.00, -10.67,
+     -9.33,  -8.00,  -6.67,  -5.33,  -4.00,  -2.67,  -1.33,   0.00,
+      1.33,   2.67,   4.00,   5.33,   6.67,   8.00,   9.33,  10.67
+  };
+  gps.angularTheta.clear();
+  gps.angularZ.clear();
+  for (int i = 0; i < 32; i++) {
+    gps.angularTheta.push_back(
+      int(std::round(std::tan(elevDeg[i] * M_PI / 180.0) * double(1 << 18))));
+    gps.angularZ.push_back(0);
+  }
 }
 
 static void
@@ -463,14 +511,24 @@ main(int argc, char* argv[])
   pcc::chrono::Stopwatch<std::chrono::steady_clock> clock_wall;
   pcc::chrono::Stopwatch<pcc::chrono::utime_inc_children_clock> clock_user;
 
-  cout << "\n[2] Encoding (PredictiveGeometry, flat ring-based loop, "
-       << params.numGroups << " context group(s)) ..." << endl;
-  cout << "  Flat residual coding mode: quantized-index" << endl;
-  cout << "  Fixed flat QP (stream-signaled): " << fixedQp << endl;
-  cout << "  Context toggles: range=" << (params.rangeCtxEnabled ? 1 : 0)
-       << " boundary=" << (params.boundaryCtxEnabled ? 1 : 0) << endl;
-  if (!params.dumpCsvPath.empty())
-    cout << "  Dumping per-point context CSV to: " << params.dumpCsvPath << endl;
+  // Angular QP: 2^flat_qp mm (flat_qp=-1 → default 64 mm = 2^6)
+  const double angQp = (params.flatQp >= 0) ? double(1 << params.flatQp) : 64.0;
+
+  if (params.angularMode) {
+    cout << "\n[2] Encoding (PredictiveGeometry, angular grid-based, spherical domain) ..." << endl;
+    cout << "  scalePhi=524288(2^19)  maxPtsPerRot=1090  rings=32 (HDL-32E)" << endl;
+    cout << "  QP=" << angQp << " mm  (--flat-qp " << params.flatQp << " → 2^" << params.flatQp << ")" << endl;
+    cout << "  Occupancy=(dRing,dColumn) + predIdx + quantized_dr + quantized_dAz" << endl;
+  } else {
+    cout << "\n[2] Encoding (PredictiveGeometry, flat ring-based loop, "
+         << params.numGroups << " context group(s)) ..." << endl;
+    cout << "  Flat residual coding mode: quantized-index" << endl;
+    cout << "  Fixed flat QP (stream-signaled): " << fixedQp << endl;
+    cout << "  Context toggles: range=" << (params.rangeCtxEnabled ? 1 : 0)
+         << " boundary=" << (params.boundaryCtxEnabled ? 1 : 0) << endl;
+    if (!params.dumpCsvPath.empty())
+      cout << "  Dumping per-point context CSV to: " << params.dumpCsvPath << endl;
+  }
 
   // Start payload buffer
   PayloadBuffer payload(PayloadType::kGeometryBrick);
@@ -486,10 +544,15 @@ main(int argc, char* argv[])
   clock_wall.start();
   clock_user.start();
 
-  encodePredictiveGeometry(
-    predGeomOpt, gps, gbh, cloud,
-    ctxtMem, aec.get(), params.numGroups,
-    fixedQp, params.rangeCtxEnabled, params.boundaryCtxEnabled, params.dumpCsvPath);
+  if (params.angularMode) {
+    setupAngularGPS(gps);
+    encodePredictiveGeometryAngular(predGeomOpt, gps, gbh, cloud, ctxtMem, aec.get(), angQp);
+  } else {
+    encodePredictiveGeometry(
+      predGeomOpt, gps, gbh, cloud,
+      ctxtMem, aec.get(), params.numGroups,
+      fixedQp, params.rangeCtxEnabled, params.boundaryCtxEnabled, params.dumpCsvPath);
+  }
 
   clock_user.stop();
   clock_wall.stop();
@@ -558,10 +621,15 @@ main(int argc, char* argv[])
   aed->setBypassBinCodingWithoutProbUpdate(sps.bypass_bin_coding_without_prob_update);
   aed->start();
 
-  decodePredictiveGeometry(
-    gps, gbhFromBitstream, decCloud,
-    decCtxtMem, aed.get(), params.numGroups,
-    params.rangeCtxEnabled, params.boundaryCtxEnabled);
+  if (params.angularMode) {
+    setupAngularGPS(gps);
+    decodePredictiveGeometryAngular(gps, gbhFromBitstream, decCloud, decCtxtMem, aed.get(), angQp);
+  } else {
+    decodePredictiveGeometry(
+      gps, gbhFromBitstream, decCloud,
+      decCtxtMem, aed.get(), params.numGroups,
+      params.rangeCtxEnabled, params.boundaryCtxEnabled);
+  }
 
   // ---- 9. Write decoder output ----
   if (!writePointCloudPly(decCloud, params.inputScale, params.decodedPath)) {
