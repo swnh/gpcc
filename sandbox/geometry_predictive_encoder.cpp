@@ -261,7 +261,7 @@ public:
   // ---- Angular grid coding (encodePredictiveGeometryAngular) ----
   void encodeAngularElevStep(int32_t dRing, int ctxL);
   void encodeAngularColStep(int32_t dColumn, int ctxL);
-  void encodeAngularPredIdx(int idx);
+  void encodeAngularPredIdx(int idx, int maxIdx);
   void encodeAngularRadius(int32_t dr, int ctxLR, int signCtx);
   void encodeAngularAzimuth(int32_t dAz, int ctxL, int signCtx);
   void encodeAngularAzimuthArc(int32_t arc_q, int ctxL, int signCtx);
@@ -344,7 +344,7 @@ private:
   AdaptiveBitModel _ctxAngColTree[2][7];
   AdaptiveBitModel _ctxAngColEgTail[2];
   AdaptiveBitModel _ctxAngColSign[2];
-  AdaptiveBitModel _ctxAngPredIdx[3];
+  AdaptiveBitModel _ctxAngPredIdx[fp::kAngularMaxPredList - 1];
   AdaptiveBitModel _ctxAngRadiusGt0[4];
   AdaptiveBitModel _ctxAngRadiusGt1[4];
   AdaptiveBitModel _ctxAngRadiusSign[2][4];
@@ -2051,12 +2051,13 @@ PredGeomEncoder::encodeAngularColStep(int32_t v, int ctxL)
 }
 
 void
-PredGeomEncoder::encodeAngularPredIdx(int idx)
+PredGeomEncoder::encodeAngularPredIdx(int idx, int maxIdx)
 {
+  const int cap = fp::kAngularMaxPredList - 2;  // last bin index
   for (int i = 0; i < idx; i++)
-    _aec->encode(1, _ctxAngPredIdx[std::min(i, 2)]);
-  if (idx < 3)
-    _aec->encode(0, _ctxAngPredIdx[std::min(idx, 2)]);
+    _aec->encode(1, _ctxAngPredIdx[std::min(i, cap)]);
+  if (idx < maxIdx)
+    _aec->encode(0, _ctxAngPredIdx[std::min(idx, cap)]);
 }
 
 void
@@ -2140,37 +2141,58 @@ encodePredictiveGeometryAngular(
   int precDAzNz = 0;        // last (qAz != 0)     -> proxy for arc activity
   const int qphiThreshold = gps.resR_context_qphi_threshold;
 
+  // TMC3-style sticky FIFO parameters (hardcoded; tune later if needed).
+  // listSize ∈ [3, kAngularMaxPredList]; thObj = |dr| threshold that promotes
+  // the current point to the FIFO tail (new-object reset).
+  const int predListSize = 3;
+  const int32_t thObj = 1024;
+
+  const fp::AngularGridPoint bootstrap{0, scalePhi >> 1, 0, true};
+
   for (int p = 0; p < numPoints; p++) {
     const auto& xyz = cloud[p];
     const int thetaIdx = fp::clampLaserIdx(cloud, p);
 
-    // Cartesian → spherical (manual, ring from metadata)
+    // Cartesian → spherical. Store phi shifted to [0, scalePhi) so that
+    // sphToCart at output gets phi in [-scalePhi/2, scalePhi/2).
     int64_t r0 = int64_t(std::round(std::hypot(double(xyz[0]), double(xyz[1]))));
     int32_t sphR = int32_t(divExp2RoundHalfUp(r0, log2ScaleRadius));
-    int32_t phi = int32_t(std::round(
+    int32_t phiSigned = int32_t(std::round(
       std::atan2(double(xyz[1]), double(xyz[0])) / (2.0 * M_PI) * scalePhi));
+    int32_t phi = fp::positiveMod(
+      int64_t(phiSigned) + (scalePhi >> 1), scalePhi);
 
-    const auto curr = fp::makeAngularGridPoint(
-      thetaIdx, phi, sphR, scalePhi, azimuthSpeed, maxPtsPerRot);
-    const auto preds = fp::makeAngularPredictors(gridState);
+    const fp::AngularGridPoint curr{thetaIdx, phi, sphR, true};
 
-    // Simple predictor selection: argmin |dr| over valid candidates.
+    // --- Syntax step 1: dRing against preds[0] (anchor) --------------------
+    const auto& anchor = gridState.count >= 1 ? gridState.preds[0] : bootstrap;
+    const int32_t dRing = curr.ring - anchor.ring;
+
+    // --- Syntax step 2: RDO over the sticky FIFO -------------------------
     int bestIdx = 0;
-    int32_t bestAbsDr = std::numeric_limits<int32_t>::max();
-    for (int i = 0; i < fp::kAngularPredCandidates; i++) {
-      if (!preds[i].valid) continue;
-      const int32_t absDr = std::abs(curr.sphR - preds[i].sphR);
-      if (absDr < bestAbsDr) { bestAbsDr = absDr; bestIdx = i; }
+    int64_t bestCost = std::numeric_limits<int64_t>::max();
+    int32_t bestDColumn = 0;
+    int32_t bestDAzShift = 0;
+    for (int i = 0; i < predListSize; i++) {
+      const auto& c = i < gridState.count ? gridState.preds[i] : bootstrap;
+      const auto d = fp::computePredRelativePhiDelta(
+        curr.phi, c.phi, scalePhi, azimuthSpeed);
+      const int64_t cost = int64_t(std::abs(curr.sphR - c.sphR))
+        + int64_t(std::abs(d.dColumn))
+        + int64_t(std::abs(curr.ring - c.ring));
+      if (cost < bestCost) {
+        bestCost = cost;
+        bestIdx = i;
+        bestDColumn = d.dColumn;
+        bestDAzShift = d.dAzShift;
+      }
     }
 
-    const auto& pred = preds[bestIdx];
-    const int32_t dRing   = curr.ring - pred.ring;
-    const int32_t dColumn =
-      fp::signedModDelta(curr.column, pred.column, maxPtsPerRot);
-    const int32_t dr      = curr.sphR - pred.sphR;
-    // Azimuth-shift is periodic in scalePhi; keep the shortest wrapped delta.
-    const int32_t dAz = fp::signedModDelta(
-      curr.azimuthShift, pred.azimuthShift, scalePhi);
+    const fp::AngularGridPoint pred =
+      bestIdx < gridState.count ? gridState.preds[bestIdx] : bootstrap;
+    const int32_t dColumn = bestDColumn;
+    const int32_t dAz = bestDAzShift;
+    const int32_t dr = curr.sphR - pred.sphR;
 
     int32_t qDr, reconDr, qAz, reconDAz, reconR;
     if (lossless) {
@@ -2178,7 +2200,6 @@ encodePredictiveGeometryAngular(
       qAz = dAz; reconDAz = dAz;
       reconR = pred.sphR + dr;
     } else {
-      // TMC3-style primary radius handling: no explicit dr quantization step.
       qDr = dr;
       reconDr = dr;
       reconR = std::max<int32_t>(0, pred.sphR + reconDr);
@@ -2198,15 +2219,17 @@ encodePredictiveGeometryAngular(
         qAz << arcQuantLog2, rScaled, azimuthTwoPiLog2);
     }
 
-    const int ctxL = (bestIdx > 0) ? 1 : 0;
+    // ctxL now splits same-ring vs cross-ring predictors (was: predIdx>0).
+    // This matches the physical locality of the candidate list.
+    const int ctxL = (pred.ring != curr.ring) ? 1 : 0;
     const int qphiBucket = std::abs(dColumn) > qphiThreshold ? 2 : 0;
     const int ctxLR = ctxL + qphiBucket;
     const int signCtxR = (precDColumnNz ? 2 : 0) + precSignR;
-    const int signCtxAz = (precDAzNz ? 2 : 0)
-      + (lossless ? precSignArc : precSignArc);
+    const int signCtxAz = (precDAzNz ? 2 : 0) + precSignArc;
 
-    enc.encodeAngularPredIdx(bestIdx);
-    enc.encodeAngularElevStep(dRing, ctxL);
+    // Emission order: dRing → predIdx → dColumn → dr → dAz|arc
+    enc.encodeAngularElevStep(dRing, /*ctxL=*/0);
+    enc.encodeAngularPredIdx(bestIdx, predListSize - 1);
     enc.encodeAngularColStep(dColumn, ctxL);
     enc.encodeAngularRadius(qDr, ctxLR, signCtxR);
     if (lossless) enc.encodeAngularAzimuth(qAz, ctxL, signCtxAz);
@@ -2225,19 +2248,13 @@ encodePredictiveGeometryAngular(
     }
     prevRing = curr.ring;
 
-    // Reconstruct grid point (wrap column, canonicalize azimuthShift)
-    fp::AngularGridPoint recon{
-      curr.ring,
-      fp::wrapColumn(int64_t(pred.column) + dColumn, maxPtsPerRot),
-      reconR,
-      pred.azimuthShift + reconDAz,
-      true};
-    recon = fp::canonicalizeAngularGridPoint(
-      recon, scalePhi, azimuthSpeed, maxPtsPerRot);
+    // Reconstruct phi from the selected pred + (dColumn, reconDAz).
+    const int32_t reconPhi = fp::reconstructAngularPhi(
+      pred.phi, dColumn, reconDAz, scalePhi, azimuthSpeed);
+    const fp::AngularGridPoint recon{curr.ring, reconPhi, reconR, true};
 
-    const int32_t reconPhi =
-      fp::reconstructAngularPhi(recon, scalePhi, azimuthSpeed);
-    outCloud[p] = origin + sphToCart({recon.sphR, reconPhi, recon.ring});
+    const int32_t reconPhiSigned = reconPhi - (scalePhi >> 1);
+    outCloud[p] = origin + sphToCart({recon.sphR, reconPhiSigned, recon.ring});
 
     if (cloud.hasLaserAngles())
       outCloud.setLaserAngle(p, cloud.getLaserAngle(p));
@@ -2246,7 +2263,11 @@ encodePredictiveGeometryAngular(
     if (cloud.hasReflectances())
       outCloud.setReflectance(p, cloud.getReflectance(p));
 
-    gridState.push(recon);
+    // Sticky FIFO update with TMC3-style new-object detection.
+    const int32_t anchorSphR = gridState.count >= 1 ? gridState.preds[0].sphR : 0;
+    const bool newObject = std::abs(recon.sphR - anchorSphR) > thObj;
+    gridState.updateSticky(recon, bestIdx, predListSize, newObject);
+    if (metrics && newObject) metrics->newObjectHits++;
   }
 
   enc.encodeEndOfTreesFlag(true);

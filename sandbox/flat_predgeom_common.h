@@ -260,41 +260,56 @@ residualL1(const point_t& residual)
 
 // Angular-grid predictor state.  These helpers are shared by the sandbox
 // encoder and decoder so predictor-relative syntax stays bit-exact.
-static const int kAngularPredCandidates = 4;
+//
+// Grid mapping is *pred-relative*: the integer "column multiplier" dColumn is
+// computed as round((curr.phi - pred.phi) / azimuthSpeed) against the
+// selected pred's actual phi, not against a global scalePhi frame.  The FIFO
+// stores raw phi only; column is never materialized in state.
+//
+// Pred list is a TMC3-style sticky FIFO of up to kAngularMaxPredList slots.
+// On each point, the encoder picks bestIdx and the FIFO update shifts only
+// slots [0..bestIdx] — deeper slots persist as long-term exemplars.  When
+// |curr.sphR - preds[0].sphR| exceeds a "new-object" threshold, the update
+// forces a full-list shift (bestIdx = listSize-1) so the jumped radius lands
+// in the tail rather than poisoning the common slots.  Cross-packet state is
+// carried seamlessly — nothing resets at packet boundaries.
+static const int kAngularMaxPredList = 7;
 
 struct AngularGridPoint {
   AngularGridPoint() = default;
-  AngularGridPoint(
-    int32_t r, int32_t c, int32_t sR, int32_t az, bool v)
-    : ring(r), column(c), sphR(sR), azimuthShift(az), valid(v)
+  AngularGridPoint(int32_t r, int32_t ph, int32_t sR, bool v)
+    : ring(r), phi(ph), sphR(sR), valid(v)
   {}
 
-  int32_t ring = 0;
-  int32_t column = 0;
-  int32_t sphR = 0;
-  int32_t azimuthShift = 0;
-  bool valid = false;
+  int32_t ring  = 0;
+  int32_t phi   = 0;   // raw phi in [0, scalePhi)
+  int32_t sphR  = 0;
+  bool    valid = false;
 };
 
 struct AngularGridState {
-  // Flat FIFO of last kAngularPredCandidates encoded points.
-  // preds[0] = most recent; preds[kAngularPredCandidates-1] = oldest.
-  std::array<AngularGridPoint, kAngularPredCandidates> preds = {};
+  // Sticky FIFO: preds[0] = most recent; slots beyond bestIdx persist across
+  // updates until evicted by a new-object shift or by accumulated wins.
+  std::array<AngularGridPoint, kAngularMaxPredList> preds = {};
   int count = 0;
 
-  void push(const AngularGridPoint& pt)
+  // Sticky update with optional new-object reset.
+  void updateSticky(
+    const AngularGridPoint& pt, int bestIdx, int listSize, bool newObject)
   {
-    for (int i = kAngularPredCandidates - 1; i > 0; --i)
+    const int shiftEnd = newObject ? (listSize - 1) : bestIdx;
+    for (int i = shiftEnd; i > 0; --i)
       preds[i] = preds[i - 1];
     preds[0] = pt;
-    count = std::min(count + 1, kAngularPredCandidates);
+    count = std::min(count + 1, listSize);
   }
 };
 
 struct AngularMetrics {
-  std::array<int, kAngularPredCandidates> predIdxHist = {};
+  std::array<int, kAngularMaxPredList> predIdxHist = {};
   int sameRingHit = 0;       // # points where preds[bestIdx].ring == curr.ring
   int ringTransitions = 0;   // # points where curr.ring != prev.ring
+  int newObjectHits = 0;     // # points that triggered the new-object reset
 };
 
 inline int32_t
@@ -338,56 +353,57 @@ roundDivPow2Signed(int32_t v, int log2Step)
   return v < 0 ? -int32_t(q) : int32_t(q);
 }
 
-inline AngularGridPoint
-makeAngularGridPoint(
-  int32_t ring,
-  int32_t phi,
-  int32_t sphR,
-  int32_t scalePhi,
-  int32_t azimuthSpeed,
-  int32_t maxPtsPerRot)
+// Round v / d to nearest integer, signed. d > 0, d may not be power-of-2.
+inline int32_t
+roundDivSigned(int64_t v, int32_t d)
 {
-  const int32_t phiShifted = positiveMod(int64_t(phi) + (scalePhi >> 1), scalePhi);
-  const int32_t column = wrapColumn(
-    (int64_t(phiShifted) + (azimuthSpeed >> 1)) / azimuthSpeed,
-    maxPtsPerRot);
-  const int32_t azimuthShift = signedModDelta(
-    phiShifted, int64_t(column) * azimuthSpeed, scalePhi);
-  return {ring, column, sphR, azimuthShift, true};
+  const int64_t half = d / 2;
+  return v >= 0 ? int32_t((v + half) / d) : -int32_t((-v + half) / d);
 }
 
+// Decompose signed phi delta into (integer dColumn multiplier of azimuthSpeed,
+// sub-step dAzShift residual). Reconstruction: dPhi = dColumn*azSpeed + dAzShift.
+struct AngularPhiDelta {
+  int32_t dColumn  = 0;
+  int32_t dAzShift = 0;
+};
+
+inline AngularPhiDelta
+computePredRelativePhiDelta(
+  int32_t currPhi, int32_t predPhi, int32_t scalePhi, int32_t azimuthSpeed)
+{
+  AngularPhiDelta out;
+  const int32_t dPhi = signedModDelta(currPhi, predPhi, scalePhi);
+  out.dColumn  = roundDivSigned(int64_t(dPhi), azimuthSpeed);
+  out.dAzShift = int32_t(int64_t(dPhi) - int64_t(out.dColumn) * azimuthSpeed);
+  return out;
+}
+
+// Rebuild curr phi from a selected pred plus (dColumn, dAzShift).
 inline int32_t
 reconstructAngularPhi(
-  const AngularGridPoint& pt,
-  int32_t scalePhi,
-  int32_t azimuthSpeed)
+  int32_t predPhi, int32_t dColumn, int32_t dAzShift,
+  int32_t scalePhi, int32_t azimuthSpeed)
 {
-  const int32_t phiShifted = positiveMod(
-    int64_t(pt.column) * azimuthSpeed + pt.azimuthShift, scalePhi);
-  return phiShifted - (scalePhi >> 1);
+  const int64_t raw = int64_t(predPhi)
+    + int64_t(dColumn) * azimuthSpeed + int64_t(dAzShift);
+  return positiveMod(raw, scalePhi);
 }
 
-inline AngularGridPoint
-canonicalizeAngularGridPoint(
-  const AngularGridPoint& pt,
-  int32_t scalePhi,
-  int32_t azimuthSpeed,
-  int32_t maxPtsPerRot)
+// Build a raw-FIFO candidate view of length listSize.  Slots beyond
+// state.count are zero-bootstrap (valid=true so the RDO still considers
+// them).  No ring filtering, no linear extrapolation — the sticky FIFO
+// update on the encoder/decoder side does all the specialization.
+inline std::array<AngularGridPoint, kAngularMaxPredList>
+viewAngularCandidates(const AngularGridState& state, int listSize, int32_t scalePhi)
 {
-  return makeAngularGridPoint(
-    pt.ring, reconstructAngularPhi(pt, scalePhi, azimuthSpeed), pt.sphR,
-    scalePhi, azimuthSpeed, maxPtsPerRot);
-}
-
-inline std::array<AngularGridPoint, kAngularPredCandidates>
-makeAngularPredictors(const AngularGridState& state)
-{
-  AngularGridPoint bootstrap{0, 0, 0, 0, true};
-  std::array<AngularGridPoint, kAngularPredCandidates> preds = {
-    bootstrap, bootstrap, bootstrap, bootstrap};
-  for (int i = 0; i < state.count; i++)
-    preds[i] = state.preds[i];
-  return preds;
+  std::array<AngularGridPoint, kAngularMaxPredList> cands = {};
+  const AngularGridPoint bootstrap{0, scalePhi >> 1, 0, true};
+  for (int i = 0; i < kAngularMaxPredList; ++i) {
+    cands[i] = i < state.count ? state.preds[i] : bootstrap;
+  }
+  (void)listSize;
+  return cands;
 }
 
 inline int32_t

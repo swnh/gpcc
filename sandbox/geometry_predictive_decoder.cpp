@@ -122,7 +122,7 @@ public:
   // ---- Angular grid coding (decodePredictiveGeometryAngular) ----
   int32_t decodeAngularElevStep(int ctxL);
   int32_t decodeAngularColStep(int ctxL);
-  int decodeAngularPredIdx();
+  int decodeAngularPredIdx(int maxIdx);
   int32_t decodeAngularRadius(int ctxLR, int signCtx);
   int32_t decodeAngularAzimuth(int ctxL, int signCtx);
   int32_t decodeAngularAzimuthArc(int ctxL, int signCtx);
@@ -211,7 +211,7 @@ private:
   AdaptiveBitModel _ctxAngColTree[2][7];
   AdaptiveBitModel _ctxAngColEgTail[2];
   AdaptiveBitModel _ctxAngColSign[2];
-  AdaptiveBitModel _ctxAngPredIdx[3];
+  AdaptiveBitModel _ctxAngPredIdx[fp::kAngularMaxPredList - 1];
   AdaptiveBitModel _ctxAngRadiusGt0[4];
   AdaptiveBitModel _ctxAngRadiusGt1[4];
   AdaptiveBitModel _ctxAngRadiusSign[2][4];
@@ -1014,10 +1014,11 @@ PredGeomDecoder::decodeAngularColStep(int ctxL)
 }
 
 int
-PredGeomDecoder::decodeAngularPredIdx()
+PredGeomDecoder::decodeAngularPredIdx(int maxIdx)
 {
+  const int cap = fp::kAngularMaxPredList - 2;
   int idx = 0;
-  while (idx < 3 && _aed->decode(_ctxAngPredIdx[idx]))
+  while (idx < maxIdx && _aed->decode(_ctxAngPredIdx[std::min(idx, cap)]))
     idx++;
   return idx;
 }
@@ -1088,28 +1089,35 @@ decodePredictiveGeometryAngular(
   int precDAzNz = 0;
   const int qphiThreshold = gps.resR_context_qphi_threshold;
 
-  for (int p = 0; p < numPoints; p++) {
-    const auto preds = fp::makeAngularPredictors(gridState);
-    const int predIdx = dec.decodeAngularPredIdx();
-    if (predIdx < 0 || predIdx >= fp::kAngularPredCandidates)
-      throw std::runtime_error("angular predgeom: decoded invalid predIdx");
-    const auto& pred = preds[predIdx];
-    if (!pred.valid)
-      throw std::runtime_error("angular predgeom: decoded invalid predictor");
+  const fp::AngularGridPoint bootstrap{0, scalePhi >> 1, 0, true};
+  // Must match encoder.
+  const int predListSize = 3;
+  const int32_t thObj = 1024;
 
-    const int ctxL = (predIdx > 0) ? 1 : 0;
+  for (int p = 0; p < numPoints; p++) {
+    // --- Step 1: dRing first, relative to anchor = preds[0] -----------------
+    const auto& anchor = gridState.count >= 1 ? gridState.preds[0] : bootstrap;
+    const int32_t dRing = dec.decodeAngularElevStep(/*ctxL=*/0);
+    const int32_t ring = anchor.ring + dRing;
+    if (ring < 0 || ring >= fp::kNumRings)
+      throw std::runtime_error("angular predgeom: decoded ring out of range");
+
+    // --- Step 2: decode predIdx over the sticky FIFO ------------------------
+    const int predIdx = dec.decodeAngularPredIdx(predListSize - 1);
+    if (predIdx < 0 || predIdx >= predListSize)
+      throw std::runtime_error("angular predgeom: decoded invalid predIdx");
+    const fp::AngularGridPoint pred =
+      predIdx < gridState.count ? gridState.preds[predIdx] : bootstrap;
+
+    const int ctxL = (pred.ring != ring) ? 1 : 0;
     const int signCtxR = (precDColumnNz ? 2 : 0) + precSignR;
     const int signCtxAz = (precDAzNz ? 2 : 0) + precSignArc;
 
-    const int32_t dRing   = dec.decodeAngularElevStep(ctxL);
-    const int     ring    = pred.ring + dRing;
-    if (ring < 0 || ring >= fp::kNumRings)
-      throw std::runtime_error("angular predgeom: decoded ring out of range");
     const int32_t dColumn = dec.decodeAngularColStep(ctxL);
     const int qphiBucket = std::abs(dColumn) > qphiThreshold ? 2 : 0;
     const int ctxLR = ctxL + qphiBucket;
-    const int32_t qDr     = dec.decodeAngularRadius(ctxLR, signCtxR);
-    const int32_t qAz     = lossless
+    const int32_t qDr = dec.decodeAngularRadius(ctxLR, signCtxR);
+    const int32_t qAz = lossless
       ? dec.decodeAngularAzimuth(ctxL, signCtxAz)
       : dec.decodeAngularAzimuthArc(ctxL, signCtxAz);
 
@@ -1123,26 +1131,23 @@ decodePredictiveGeometryAngular(
       reconDr = qDr; reconDAz = qAz;
       reconR  = pred.sphR + qDr;
     } else {
-      // TMC3-style primary radius handling: no explicit dr quantization step.
       reconDr = qDr;
       reconR  = std::max<int32_t>(0, pred.sphR + reconDr);
       reconDAz = fp::angularArcToPhiResidual(
         qAz << arcQuantLog2, reconR << 3, azimuthTwoPiLog2);
     }
 
-    fp::AngularGridPoint recon{
-      int32_t(ring),
-      fp::wrapColumn(int64_t(pred.column) + dColumn, maxPtsPerRot),
-      reconR,
-      pred.azimuthShift + reconDAz,
-      true};
-    recon = fp::canonicalizeAngularGridPoint(
-      recon, scalePhi, azimuthSpeed, maxPtsPerRot);
+    // Reconstruct phi from pred frame (subtract-then-round inverse).
+    const int32_t reconPhi = fp::reconstructAngularPhi(
+      pred.phi, dColumn, reconDAz, scalePhi, azimuthSpeed);
+    const fp::AngularGridPoint recon{ring, reconPhi, reconR, true};
 
-    const int32_t reconPhi =
-      fp::reconstructAngularPhi(recon, scalePhi, azimuthSpeed);
-    cloud[p] = origin + sphToCart({recon.sphR, reconPhi, recon.ring});
-    gridState.push(recon);
+    const int32_t reconPhiSigned = reconPhi - (scalePhi >> 1);
+    cloud[p] = origin + sphToCart({recon.sphR, reconPhiSigned, recon.ring});
+
+    const int32_t anchorSphR = gridState.count >= 1 ? gridState.preds[0].sphR : 0;
+    const bool newObject = std::abs(recon.sphR - anchorSphR) > thObj;
+    gridState.updateSticky(recon, predIdx, predListSize, newObject);
   }
 
   while (!dec.decodeEndOfTreesFlag()) {}
