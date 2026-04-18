@@ -12,8 +12,10 @@
 
 #include "TMC3.h"
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <cmath>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -24,6 +26,7 @@
 
 #include "PayloadBuffer.h"
 #include "entropy.h"
+#include "flat_predgeom_common.h"
 #include "geometry.h"
 #include "geometry_predictive.h"
 #include "geometry_params.h"
@@ -42,19 +45,34 @@ using namespace pcc;
 // Minimal parameters for the simplified flow
 // ============================================================================
 struct SimpleParams {
-  string inputPlyPath = "/home/swnh/pgc/datasets/nuscenes/v1.0-mini/ply/bin/scene-0061/scene-0061_00.ply";  // --input
-  string outputBitstreamPath = "/home/swnh/gpcc/experiments/predgeom.bin";  // --output
-  string reconstructedPath = "/home/swnh/gpcc/experiments/recon.ply";       // --recon
-  string decodedPath = "/home/swnh/gpcc/experiments/decoded.ply";           // --decoded
-  string dumpCsvPath;                           // --dump-csv
-  string summaryCsvPath = "scripts/flat_qres_qp_summary.csv";  // --summary-csv
-  double inputScale = 1.0;                      // --scale
-  int    numGroups  = 1;                        // --groups
-  int    flatQp = -1;                           // --flat-qp
-  bool   rangeCtxEnabled = true;                // --range-ctx
-  bool   boundaryCtxEnabled = true;             // --boundary-ctx
-  bool   angularMode = false;                   // --angular
+  string inputPlyPath = "/home/swnh/pgc/datasets/nuscenes/v1.0-mini/ply/bin/scene-0061/scene-0061_00.ply";
+  string outputBitstreamPath = "/home/swnh/gpcc/experiments/predgeom.bin";
+  string reconstructedPath = "/home/swnh/gpcc/experiments/recon.ply";
+  string decodedPath = "/home/swnh/gpcc/experiments/decoded.ply";
+  string dumpCsvPath;
+  string summaryCsvPath = "scripts/flat_qres_qp_summary.csv";
+  double inputScale = 1.0;
+  int    numGroups  = 1;
+  int    flatQp = -1;
+  string ratePreset;            // set by --rate (required in angular mode)
+  int    arcLog2 = 0;           // set by --rate (azimuth arc quantization shift)
+  int    azimuthScaleLog2 = 7;  // set by --rate
+  int    azimuthSpeed = 483;    // set by --rate
+  int    radiusInvScaleLog2 = 8;// set by --rate
+  int    qphiThreshold = 3;     // set by --rate
+  bool   rangeCtxEnabled = true;
+  bool   boundaryCtxEnabled = true;
+  bool   angularMode = false;   // --mode angular (default flat)
+  bool   angularLossless = false;
+  bool   batch = false;         // --batch (laser-major, HDL-32E: 32 lasers x 12 firings)
+  bool   metrics = false;
 };
+
+static constexpr int kBatchPointsPerLaser = 12;
+static constexpr int kBatchPacketSize = 32 * kBatchPointsPerLaser;
+static constexpr bool kAngularAzimuthScaling = true;
+static constexpr bool kAngularResidual2Disabled = true;
+static constexpr bool kAngularQphiThresholdPresent = true;
 
 // ============================================================================
 // Forward declaration — the simplified encodePredictiveGeometry in
@@ -68,7 +86,9 @@ void encodePredictiveGeometryAngular(
   PCCPointSet3&,
   PredGeomContexts&,
   EntropyEncoder*,
-  double qpInt);
+  int arcQuantLog2,
+  bool lossless,
+  flat_predgeom::AngularMetrics* metrics = nullptr);
 
 void decodePredictiveGeometryAngular(
   const GeometryParameterSet&,
@@ -76,7 +96,8 @@ void decodePredictiveGeometryAngular(
   PCCPointSet3&,
   PredGeomContexts&,
   EntropyDecoder*,
-  double qpInt);
+  int arcQuantLog2,
+  bool lossless);
 
 void encodePredictiveGeometry(
   const PredGeomEncOpts& opt,
@@ -103,56 +124,281 @@ void decodePredictiveGeometry(
 }
 
 // ============================================================================
+static void
+printUsage(const char* argv0)
+{
+  cerr << "Usage: " << argv0
+       << " --input <ply> [--mode <flat|angular>] [options]\n"
+       << "  Common:  --output <bin> --recon <ply> --decoded <ply>\n"
+       << "           --scale N --summary-csv <csv>\n"
+       << "  Flat:    --groups <1|2|4|8|16|32> [--flat-qp N] [--range 0|1]\n"
+       << "           [--boundary 0|1] [--dump-csv <csv>]\n"
+       << "  Angular: --rate <r06|r05|r04|r03|r02|r01>\n"
+       << "           [--angular-lossless] [--batch] [--metrics]\n";
+}
+
+static bool
+parseIntOption(const string& name, const string& value, int* out)
+{
+  try {
+    size_t pos = 0;
+    const int parsed = stoi(value, &pos);
+    if (pos != value.size())
+      throw std::invalid_argument("junk");
+    *out = parsed;
+    return true;
+  } catch (...) {
+    cerr << "Error: " << name << " expects an integer, got '" << value << "'\n";
+    return false;
+  }
+}
+
+static bool
+parseDoubleOption(const string& name, const string& value, double* out)
+{
+  try {
+    size_t pos = 0;
+    const double parsed = stod(value, &pos);
+    if (pos != value.size())
+      throw std::invalid_argument("junk");
+    *out = parsed;
+    return true;
+  } catch (...) {
+    cerr << "Error: " << name << " expects a number, got '" << value << "'\n";
+    return false;
+  }
+}
+
+static bool
+parseBool01Option(const string& name, const string& value, bool* out)
+{
+  if (value == "0") {
+    *out = false;
+    return true;
+  }
+  if (value == "1") {
+    *out = true;
+    return true;
+  }
+  cerr << "Error: " << name << " expects 0 or 1, got '" << value << "'\n";
+  return false;
+}
+
+// ============================================================================
 static bool
 parseSimpleArgs(int argc, char* argv[], SimpleParams& p)
 {
-  if (argc < 3) {
-    cerr << "Usage: " << argv[0]
-         << " --input <ply> [--output <bitstream.bin>] [--recon <recon.ply>]"
-         << " [--decoded <decoded.ply>]"
-         << " [--scale <inputScale>] [--groups <1|2|4|8|16|32>]"
-         << " [--dump-csv <context.csv>]"
-         << " [--flat-qp <int>] [--range <0|1>] [--boundary <0|1>]"
-         << " [--summary-csv <summary.csv>] [--angular]\n";
+  if (argc == 1) {
+    printUsage(argv[0]);
     return false;
   }
+
+  bool sawInput = false;
+  bool sawRate = false;
+  bool usedFlatOnlyFlag = false;
+  bool usedAngularOnlyFlag = false;
+
+  auto isPrefix = [](const string& arg, const string& prefix) {
+    return arg.rfind(prefix, 0) == 0;
+  };
+
+  auto rejectLegacyOption = [&](const string& arg) {
+    if (arg == "-i" || isPrefix(arg, "-i=")) {
+      cerr << "Error: -i was removed. Use --input <ply>\n";
+      return true;
+    }
+    if (arg == "-o" || isPrefix(arg, "-o=")) {
+      cerr << "Error: -o was removed. Use --output <bin>\n";
+      return true;
+    }
+    if (arg == "-r" || isPrefix(arg, "-r=")) {
+      cerr << "Error: -r was removed. Use --recon <ply>\n";
+      return true;
+    }
+    if (arg == "-d" || isPrefix(arg, "-d=")) {
+      cerr << "Error: -d was removed. Use --decoded <ply>\n";
+      return true;
+    }
+    if (arg == "-s" || isPrefix(arg, "-s=")) {
+      cerr << "Error: -s was removed. Use --scale N\n";
+      return true;
+    }
+    if (arg == "-g" || isPrefix(arg, "-g=")) {
+      cerr << "Error: -g was removed. Use --groups N\n";
+      return true;
+    }
+    if (arg == "--qp" || isPrefix(arg, "--qp=")) {
+      cerr << "Error: --qp was removed. Use --flat-qp N\n";
+      return true;
+    }
+    if (arg == "--angular" || isPrefix(arg, "--angular=")) {
+      cerr << "Error: --angular was removed. Use --mode angular\n";
+      return true;
+    }
+    if (arg == "--angular-rate" || isPrefix(arg, "--angular-rate=")) {
+      cerr << "Error: --angular-rate was removed. Use --rate <preset>\n";
+      return true;
+    }
+    return false;
+  };
+
+  auto applyRatePreset = [&](const string& rate) {
+    if (rate == "r06") {
+      p.azimuthScaleLog2 = 12; p.azimuthSpeed = 15463;
+      p.radiusInvScaleLog2 = 1; p.qphiThreshold = 0;
+      p.arcLog2 = 0;
+    } else if (rate == "r05") {
+      p.azimuthScaleLog2 = 11; p.azimuthSpeed = 7732;
+      p.radiusInvScaleLog2 = 2; p.qphiThreshold = 0;
+      p.arcLog2 = 0;
+    } else if (rate == "r04") {
+      p.azimuthScaleLog2 = 9; p.azimuthSpeed = 1934;
+      p.radiusInvScaleLog2 = 4; p.qphiThreshold = 0;
+      p.arcLog2 = 0;
+    } else if (rate == "r03") {
+      p.azimuthScaleLog2 = 8; p.azimuthSpeed = 967;
+      p.radiusInvScaleLog2 = 5; p.qphiThreshold = 1;
+      p.arcLog2 = 0;
+    } else if (rate == "r02") {
+      p.azimuthScaleLog2 = 7; p.azimuthSpeed = 483;
+      p.radiusInvScaleLog2 = 7; p.qphiThreshold = 3;
+      p.arcLog2 = 0;
+    } else if (rate == "r01") {
+      p.azimuthScaleLog2 = 7; p.azimuthSpeed = 483;
+      p.radiusInvScaleLog2 = 8; p.qphiThreshold = 3;
+      p.arcLog2 = 0;
+    } else {
+      return false;
+    }
+    p.ratePreset = rate;
+    return true;
+  };
+
   for (int i = 1; i < argc; i++) {
     string arg = argv[i];
-    if ((arg == "--input" || arg == "-i") && i + 1 < argc)
-      p.inputPlyPath = argv[++i];
-    else if ((arg == "--output" || arg == "-o") && i + 1 < argc)
-      p.outputBitstreamPath = argv[++i];
-    else if ((arg == "--recon" || arg == "-r") && i + 1 < argc)
-      p.reconstructedPath = argv[++i];
-    else if ((arg == "--decoded" || arg == "-d") && i + 1 < argc)
-      p.decodedPath = argv[++i];
-    else if ((arg == "--scale" || arg == "-s") && i + 1 < argc)
-      p.inputScale = atof(argv[++i]);
-    else if ((arg == "--groups" || arg == "-g") && i + 1 < argc)
-      p.numGroups = atoi(argv[++i]);
-    else if (arg == "--dump-csv" && i + 1 < argc)
-      p.dumpCsvPath = argv[++i];
-    else if (arg == "--summary-csv" && i + 1 < argc)
-      p.summaryCsvPath = argv[++i];
-    else if ((arg == "--flat-qp" || arg == "--qp") && i + 1 < argc)
-      p.flatQp = atoi(argv[++i]);
-    else if (arg == "--range" && i + 1 < argc)
-      p.rangeCtxEnabled = atoi(argv[++i]) != 0;
-    else if (arg == "--boundary" && i + 1 < argc)
-      p.boundaryCtxEnabled = atoi(argv[++i]) != 0;
-    else if (arg == "--angular")
-      p.angularMode = true;
+
+    if (arg == "--help") {
+      printUsage(argv[0]);
+      return false;
+    }
+    if (rejectLegacyOption(arg))
+      return false;
+
+    auto getValue = [&](const string& longName, string* value) {
+      const string prefix = longName + "=";
+      if (arg.rfind(prefix, 0) == 0) {
+        *value = arg.substr(prefix.size());
+        return true;
+      }
+      if (arg == longName && i + 1 < argc) {
+        *value = argv[++i];
+        return true;
+      }
+      return false;
+    };
+    string value;
+    if (getValue("--input", &value)) {
+      p.inputPlyPath = value;
+      sawInput = true;
+    }
+    else if (getValue("--mode", &value)) {
+      if (value == "flat")
+        p.angularMode = false;
+      else if (value == "angular")
+        p.angularMode = true;
+      else {
+        cerr << "Error: --mode must be flat or angular\n";
+        return false;
+      }
+    }
+    else if (getValue("--output", &value))
+      p.outputBitstreamPath = value;
+    else if (getValue("--recon", &value))
+      p.reconstructedPath = value;
+    else if (getValue("--decoded", &value))
+      p.decodedPath = value;
+    else if (getValue("--scale", &value)) {
+      if (!parseDoubleOption("--scale", value, &p.inputScale))
+        return false;
+    }
+    else if (getValue("--groups", &value)) {
+      if (!parseIntOption("--groups", value, &p.numGroups))
+        return false;
+      usedFlatOnlyFlag = true;
+    }
+    else if (getValue("--dump-csv", &value)) {
+      p.dumpCsvPath = value;
+      usedFlatOnlyFlag = true;
+    }
+    else if (getValue("--summary-csv", &value))
+      p.summaryCsvPath = value;
+    else if (getValue("--flat-qp", &value)) {
+      if (!parseIntOption("--flat-qp", value, &p.flatQp))
+        return false;
+      usedFlatOnlyFlag = true;
+    }
+    else if (getValue("--dr-log2", &value) || getValue("--arc-log2", &value)) {
+      cerr << "Error: --dr-log2/--arc-log2 were removed. "
+           << "Quantization is controlled by --rate.\n";
+      return false;
+    }
+    else if (getValue("--rate", &value)) {
+      if (!applyRatePreset(value)) {
+        cerr << "Error: --rate must be one of r06,r05,r04,r03,r02,r01\n";
+        return false;
+      }
+      sawRate = true;
+      usedAngularOnlyFlag = true;
+    }
+    else if (getValue("--range", &value)) {
+      if (!parseBool01Option("--range", value, &p.rangeCtxEnabled))
+        return false;
+      usedFlatOnlyFlag = true;
+    }
+    else if (getValue("--boundary", &value)) {
+      if (!parseBool01Option("--boundary", value, &p.boundaryCtxEnabled))
+        return false;
+      usedFlatOnlyFlag = true;
+    }
+    else if (arg == "--angular-lossless") {
+      p.angularLossless = true;
+      usedAngularOnlyFlag = true;
+    }
+    else if (arg == "--batch") {
+      p.batch = true;
+      usedAngularOnlyFlag = true;
+    }
+    else if (arg == "--metrics") {
+      p.metrics = true;
+      usedAngularOnlyFlag = true;
+    }
     else {
       cerr << "Unknown option: " << arg << "\n";
       return false;
     }
   }
-  if (p.inputPlyPath.empty()) {
+
+  if (!sawInput || p.inputPlyPath.empty()) {
     cerr << "Error: --input is required\n";
     return false;
   }
   if (p.flatQp < -1) {
-    cerr << "Error: --flat-qp must be >= 0 when provided\n";
+    cerr << "Error: --flat-qp must be >= -1\n";
+    return false;
+  }
+  if (p.angularMode) {
+    if (!sawRate) {
+      cerr << "Error: --mode angular requires --rate <r06|r05|r04|r03|r02|r01>\n";
+      return false;
+    }
+    if (usedFlatOnlyFlag) {
+      cerr << "Error: flat-only options (--groups/--flat-qp/--range/--boundary/--dump-csv)"
+           << " cannot be used with --mode angular\n";
+      return false;
+    }
+  } else if (sawRate || usedAngularOnlyFlag) {
+    cerr << "Error: angular options (--rate/--angular-lossless/--batch/--metrics)"
+         << " require --mode angular\n";
     return false;
   }
   return true;
@@ -238,29 +484,38 @@ setupMinimalGPS(GeometryParameterSet& gps)
 }
 
 static void
-setupAngularGPS(GeometryParameterSet& gps)
+setupAngularGPS(GeometryParameterSet& gps, const SimpleParams& params)
 {
   gps.geom_angular_mode_enabled_flag = true;
-  gps.azimuth_scaling_enabled_flag   = false;
-  gps.geom_angular_azimuth_scale_log2_minus11 = 7;  // scalePhi = 2^19 = 524288
-  gps.geom_angular_radius_inv_scale_log2      = 0;  // sphR = raw internal units (mm)
-  gps.geom_angular_azimuth_speed_minus1       = 0;
+  gps.azimuth_scaling_enabled_flag = kAngularAzimuthScaling;
+  gps.residual2_disabled_flag = kAngularResidual2Disabled;
+  gps.resR_context_qphi_threshold_present_flag =
+    kAngularQphiThresholdPresent;
+  gps.resR_context_qphi_threshold = params.qphiThreshold;
+  gps.geom_angular_azimuth_scale_log2_minus11 =
+    params.azimuthScaleLog2;
+  gps.geom_angular_radius_inv_scale_log2 =
+    params.radiusInvScaleLog2;
+  gps.geom_angular_azimuth_speed_minus1 =
+    std::max(1, params.azimuthSpeed) - 1;
+  gps.predgeom_max_pred_index                 = 3;
   gps.geom_slice_angular_origin_present_flag  = false;
   gps.gpsAngularOrigin = 0;
 
-  // Velodyne HDL-32E: 32 rings, -30.67° to +10.67°, ~1.33° steps
-  // angularTheta[i] = round(tan(elev_i * pi/180) * 2^18)
-  static const double elevDeg[32] = {
-    -30.67, -29.33, -28.00, -26.67, -25.33, -24.00, -22.67, -21.33,
-    -20.00, -18.67, -17.33, -16.00, -14.67, -13.33, -12.00, -10.67,
-     -9.33,  -8.00,  -6.67,  -5.33,  -4.00,  -2.67,  -1.33,   0.00,
-      1.33,   2.67,   4.00,   5.33,   6.67,   8.00,   9.33,  10.67
+  // Match TMC3 --lasersTheta semantics:
+  // angularTheta[i] = round(lasersTheta[i] * 2^18), where lasersTheta is the
+  // configured per-laser value (commonly passed as the "theta" list used in
+  // experiment scripts).
+  static const double lasersThetaRaw[32] = {
+    -0.53529, -0.51191, -0.48869, -0.46530, -0.44209, -0.41888, -0.39567, -0.37228,
+    -0.34907, -0.32585, -0.30247, -0.27925, -0.25604, -0.23265, -0.20944, -0.18623,
+    -0.16284, -0.13963, -0.11624, -0.09303, -0.06981, -0.04660, -0.02321,  0.00000,
+     0.02321,  0.04660,  0.06981,  0.09303,  0.11641,  0.13963,  0.16284,  0.18623
   };
   gps.angularTheta.clear();
   gps.angularZ.clear();
   for (int i = 0; i < 32; i++) {
-    gps.angularTheta.push_back(
-      int(std::round(std::tan(elevDeg[i] * M_PI / 180.0) * double(1 << 18))));
+    gps.angularTheta.push_back(int(std::round(lasersThetaRaw[i] * double(1 << 18))));
     gps.angularZ.push_back(0);
   }
 }
@@ -313,21 +568,45 @@ isValidNumGroups(int g)
 }
 
 static bool
-writeBitstreamFileTlv(const string& path, const PayloadBuffer& payload)
+writeBitstreamFileTlv(
+  const string& path,
+  const PayloadBuffer& payload,
+  bool angularMode)
 {
   ofstream fout(path, ios::binary);
   if (!fout.is_open())
     return false;
+
+  if (angularMode) {
+    static const char kAngularMagic[4] = {'P', 'G', 'A', '2'};
+    fout.write(kAngularMagic, sizeof(kAngularMagic));
+    if (!fout.good())
+      return false;
+  }
+
   writeTlv(payload, fout);
   return fout.good();
 }
 
 static bool
-readBitstreamFileTlv(const string& path, PayloadBuffer& payload)
+readBitstreamFileTlv(const string& path, PayloadBuffer& payload, bool angularMode)
 {
   ifstream fin(path, ios::binary);
   if (!fin.is_open())
     return false;
+
+  if (angularMode) {
+    static const char kAngularMagic[4] = {'P', 'G', 'A', '2'};
+    char magic[sizeof(kAngularMagic)];
+    fin.read(magic, sizeof(magic));
+    if (!fin
+        || !std::equal(
+          std::begin(magic), std::end(magic), std::begin(kAngularMagic))) {
+      cerr << "Error: angular bitstream syntax mismatch (expected PGA2 header)." << endl;
+      return false;
+    }
+  }
+
   readTlv(fin, &payload);
   if (!fin || payload.type != PayloadType::kGeometryBrick)
     return false;
@@ -340,6 +619,73 @@ writePointCloudPly(const PCCPointSet3& cloud, const double scale, const string& 
   ply::PropertyNameMap names;
   names.position = {"x", "y", "z"};
   return ply::write(cloud, names, 1/scale, {0, 0, 0}, path, /*ascii=*/true);
+}
+
+static double
+estimateAngularZeroRadiusRatio(
+  const PCCPointSet3& cloud,
+  int radiusInvScaleLog2)
+{
+  if (!cloud.getPointCount())
+    return 0.0;
+
+  size_t zeroCount = 0;
+  for (size_t i = 0; i < cloud.getPointCount(); i++) {
+    const auto& pt = cloud[i];
+    const int64_t r0 = int64_t(std::round(std::hypot(double(pt[0]), double(pt[1]))));
+    const int32_t sphR = int32_t(divExp2RoundHalfUp(r0, radiusInvScaleLog2));
+    if (sphR == 0)
+      zeroCount++;
+  }
+
+  return double(zeroCount) / double(cloud.getPointCount());
+}
+
+// Reorder points per-packet from firing-order (column-major) to laser-major.
+//   original: f*numLasers + L        (f in [0,pointsPerLaser), L in [0,numLasers))
+//   reorder : L*pointsPerLaser + f
+// Trailing partial packet copied unchanged.
+static void
+reorderToLaserMajor(PCCPointSet3& cloud, int packetSize, int pointsPerLaser)
+{
+  if (packetSize <= 0 || pointsPerLaser <= 0
+      || packetSize % pointsPerLaser != 0)
+    return;
+  const int numLasers = packetSize / pointsPerLaser;
+  const size_t n = cloud.getPointCount();
+
+  PCCPointSet3 out;
+  out.addRemoveAttributes(cloud.hasColors(), cloud.hasReflectances());
+  if (cloud.hasLaserAngles())
+    out.addLaserAngles();
+  out.resize(n);
+
+  size_t p = 0;
+  for (; p + size_t(packetSize) <= n; p += size_t(packetSize)) {
+    for (int L = 0; L < numLasers; L++) {
+      for (int f = 0; f < pointsPerLaser; f++) {
+        const size_t src = p + size_t(f) * numLasers + L;
+        const size_t dst = p + size_t(L) * pointsPerLaser + f;
+        out[dst] = cloud[src];
+        if (cloud.hasLaserAngles())
+          out.setLaserAngle(dst, cloud.getLaserAngle(src));
+        if (cloud.hasColors())
+          out.setColor(dst, cloud.getColor(src));
+        if (cloud.hasReflectances())
+          out.setReflectance(dst, cloud.getReflectance(src));
+      }
+    }
+  }
+  for (; p < n; p++) {
+    out[p] = cloud[p];
+    if (cloud.hasLaserAngles())
+      out.setLaserAngle(p, cloud.getLaserAngle(p));
+    if (cloud.hasColors())
+      out.setColor(p, cloud.getColor(p));
+    if (cloud.hasReflectances())
+      out.setReflectance(p, cloud.getReflectance(p));
+  }
+  cloud = std::move(out);
 }
 
 struct BppSummaryRow {
@@ -492,6 +838,30 @@ main(int argc, char* argv[])
   else
     cout << "  No laser/ring metadata found; falling back to clamped point index." << endl;
 
+  if (params.angularMode) {
+    const double zeroRatio = estimateAngularZeroRadiusRatio(
+      cloud, params.radiusInvScaleLog2);
+    if (zeroRatio > 0.25) {
+      cerr << "  Warning: " << std::fixed << std::setprecision(1)
+           << (100.0 * zeroRatio)
+           << "% of points map to sphR=0 at this --scale/--rate.\n"
+           << "           This usually indicates a unit mismatch "
+           << "(eg, meter-valued PLY with --scale 1).\n"
+           << "           For nuScenes-style meter inputs, use --scale 1000."
+           << std::defaultfloat << endl;
+    }
+  }
+
+  if (params.batch && params.angularMode) {
+    reorderToLaserMajor(cloud, kBatchPacketSize, kBatchPointsPerLaser);
+    const int packets = int(cloud.getPointCount() / size_t(kBatchPacketSize));
+    cout << "  Batch mode: laser-major within "
+         << kBatchPacketSize << "-point packets ("
+         << (kBatchPacketSize / kBatchPointsPerLaser) << " lasers x "
+         << kBatchPointsPerLaser << " firings), "
+         << packets << " full packets" << endl;
+  }
+
   // ---- 3. Set up minimal parameter sets ----
   SequenceParameterSet sps;
   setupMinimalSPS(sps);
@@ -511,14 +881,30 @@ main(int argc, char* argv[])
   pcc::chrono::Stopwatch<std::chrono::steady_clock> clock_wall;
   pcc::chrono::Stopwatch<pcc::chrono::utime_inc_children_clock> clock_user;
 
-  // Angular QP: 2^flat_qp mm (flat_qp=-1 → default 64 mm = 2^6)
-  const double angQp = (params.flatQp >= 0) ? double(1 << params.flatQp) : 64.0;
-
   if (params.angularMode) {
+    const int angularPhiLog2 = params.azimuthScaleLog2 + 12;
+    const int64_t angularScalePhi = int64_t(1) << angularPhiLog2;
+    const int angularSpeed = std::max(1, params.azimuthSpeed);
+    const int64_t angularMaxPtsPerRot =
+      std::max<int64_t>(1, (angularScalePhi + (angularSpeed >> 1)) / angularSpeed);
+
     cout << "\n[2] Encoding (PredictiveGeometry, angular grid-based, spherical domain) ..." << endl;
-    cout << "  scalePhi=524288(2^19)  maxPtsPerRot=1090  rings=32 (HDL-32E)" << endl;
-    cout << "  QP=" << angQp << " mm  (--flat-qp " << params.flatQp << " → 2^" << params.flatQp << ")" << endl;
-    cout << "  Occupancy=(dRing,dColumn) + predIdx + quantized_dr + quantized_dAz" << endl;
+    cout << "  scalePhi=" << angularScalePhi << "(2^" << angularPhiLog2
+         << ")  azimuthSpeed=" << angularSpeed
+         << "  maxPtsPerRot~" << angularMaxPtsPerRot
+         << "  rings=32 (HDL-32E)" << endl;
+    cout << "  positionRadiusInvScaleLog2="
+         << params.radiusInvScaleLog2
+         << "  predGeomAzimuthQuantization="
+         << (kAngularAzimuthScaling ? 1 : 0)
+         << "  secondaryResidualDisabled="
+         << (kAngularResidual2Disabled ? 1 : 0) << endl;
+    cout << "  resRContextQphiThresholdPresentFlag="
+         << (kAngularQphiThresholdPresent ? 1 : 0)
+         << "  resRContextQphiThreshold="
+         << params.qphiThreshold << endl;
+    cout << "  arcQuantLog2=" << params.arcLog2 << endl;
+    cout << "  Syntax=predIdx + predictor-relative dRing/dColumn + residual_r + quantized_dAz" << endl;
   } else {
     cout << "\n[2] Encoding (PredictiveGeometry, flat ring-based loop, "
          << params.numGroups << " context group(s)) ..." << endl;
@@ -544,9 +930,13 @@ main(int argc, char* argv[])
   clock_wall.start();
   clock_user.start();
 
+  flat_predgeom::AngularMetrics metrics;
   if (params.angularMode) {
-    setupAngularGPS(gps);
-    encodePredictiveGeometryAngular(predGeomOpt, gps, gbh, cloud, ctxtMem, aec.get(), angQp);
+    setupAngularGPS(gps, params);
+    encodePredictiveGeometryAngular(
+      predGeomOpt, gps, gbh, cloud, ctxtMem, aec.get(),
+      params.arcLog2, params.angularLossless,
+      params.metrics ? &metrics : nullptr);
   } else {
     encodePredictiveGeometry(
       predGeomOpt, gps, gbh, cloud,
@@ -569,7 +959,8 @@ main(int argc, char* argv[])
   write(gps, gbh, gbh.footer, &payload);
 
   // ---- 6. Write bitstream ----
-  if (!writeBitstreamFileTlv(params.outputBitstreamPath, payload)) {
+  if (!writeBitstreamFileTlv(
+        params.outputBitstreamPath, payload, params.angularMode)) {
     cerr << "Error: could not write bitstream file: " << params.outputBitstreamPath << endl;
     return 1;
   }
@@ -587,7 +978,9 @@ main(int argc, char* argv[])
   cout << "\n[5] Decoding from bitstream file ..." << endl;
 
   PayloadBuffer payloadIn(PayloadType::kGeometryBrick);
-  if (!readBitstreamFileTlv(params.outputBitstreamPath, payloadIn) || payloadIn.empty()) {
+  if (!readBitstreamFileTlv(
+        params.outputBitstreamPath, payloadIn, params.angularMode)
+      || payloadIn.empty()) {
     cerr << "Error: failed to read bitstream file: " << params.outputBitstreamPath << endl;
     return 1;
   }
@@ -622,8 +1015,10 @@ main(int argc, char* argv[])
   aed->start();
 
   if (params.angularMode) {
-    setupAngularGPS(gps);
-    decodePredictiveGeometryAngular(gps, gbhFromBitstream, decCloud, decCtxtMem, aed.get(), angQp);
+    setupAngularGPS(gps, params);
+    decodePredictiveGeometryAngular(
+      gps, gbhFromBitstream, decCloud, decCtxtMem, aed.get(),
+      params.arcLog2, params.angularLossless);
   } else {
     decodePredictiveGeometry(
       gps, gbhFromBitstream, decCloud,
@@ -666,18 +1061,39 @@ main(int argc, char* argv[])
 
   // ---- 11. Report ----
   double bpp = double(8 * payload.size()) / numPoints;
+  const string runMode = params.angularMode
+    ? ("angular_s" + std::to_string(params.azimuthScaleLog2)
+        + "_v" + std::to_string(std::max(1, params.azimuthSpeed))
+        + "_r" + std::to_string(params.radiusInvScaleLog2)
+        + "_qphi" + std::to_string(params.qphiThreshold)
+        + (params.angularLossless
+            ? "_lossless"
+            : "_arc" + std::to_string(params.arcLog2)))
+    : "quantized_qp" + std::to_string(fixedQp);
   cout << "\n[8] Results:" << endl;
   cout << "  Payload size:     " << payload.size() << " B ("
        << bpp << " bpp)" << endl;
-  cout << "  Mode:             quantized_qp" << fixedQp << endl;
+  cout << "  Mode:             " << runMode << endl;
+
+  if (params.metrics && params.angularMode) {
+    const double sameRingRate = double(metrics.sameRingHit) / double(numPoints);
+    cout << "  Metrics:" << endl;
+    cout << "    predIdx hist   : [" << metrics.predIdxHist[0]
+         << "," << metrics.predIdxHist[1]
+         << "," << metrics.predIdxHist[2]
+         << "," << metrics.predIdxHist[3] << "]" << endl;
+    cout << "    sameRingHit    : " << metrics.sameRingHit << " / "
+         << numPoints << " (" << sameRingRate << ")" << endl;
+    cout << "    ringTransitions: " << metrics.ringTransitions << endl;
+  }
 
   BppSummaryRow runRow;
   runRow.inputPlyPath = params.inputPlyPath;
   runRow.numPoints = int(numPoints);
   runRow.groups = params.numGroups;
   runRow.inputScale = params.inputScale;
-  runRow.flatQp = fixedQp;
-  runRow.mode = "quantized_qp" + std::to_string(fixedQp);
+  runRow.flatQp = params.angularMode ? -1 : fixedQp;
+  runRow.mode = runMode;
   runRow.payloadBytes = payload.size();
   runRow.bpp = bpp;
 
@@ -685,7 +1101,7 @@ main(int argc, char* argv[])
     cout << "  Summary CSV:      " << params.summaryCsvPath << endl;
     BppSummaryRow qp0Row;
     BppSummaryRow currentRow;
-    if (fixedQp > 0
+    if (!params.angularMode && fixedQp > 0
         && findLatestPairForInput(params.summaryCsvPath, runRow, &qp0Row, &currentRow)) {
       const double dBytes = double(currentRow.payloadBytes) - double(qp0Row.payloadBytes);
       const double dBpp = currentRow.bpp - qp0Row.bpp;
@@ -696,8 +1112,10 @@ main(int argc, char* argv[])
            << currentRow.payloadBytes << " B, " << currentRow.bpp << " bpp" << endl;
       cout << "    delta    : " << dBytes << " B, " << dBpp << " bpp ("
            << std::showpos << dPct << "%" << std::noshowpos << ")" << endl;
-    } else if (fixedQp == 0) {
+    } else if (!params.angularMode && fixedQp == 0) {
       cout << "  QP0 run recorded (reference point for paired comparisons)." << endl;
+    } else if (params.angularMode) {
+      cout << "  Angular run recorded." << endl;
     } else {
       cout << "  Paired comparison not available yet "
            << "(need a QP0 row for this input)." << endl;

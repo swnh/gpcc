@@ -259,11 +259,12 @@ public:
   void encodeEndOfTreesFlag(int endFlag);
 
   // ---- Angular grid coding (encodePredictiveGeometryAngular) ----
-  void encodeAngularElevStep(int32_t dRing);
-  void encodeAngularColStep(int32_t dColumn);
+  void encodeAngularElevStep(int32_t dRing, int ctxL);
+  void encodeAngularColStep(int32_t dColumn, int ctxL);
   void encodeAngularPredIdx(int idx);
-  void encodeAngularRadius(int32_t dr);
-  void encodeAngularAzimuth(int32_t dAz);
+  void encodeAngularRadius(int32_t dr, int ctxLR, int signCtx);
+  void encodeAngularAzimuth(int32_t dAz, int ctxL, int signCtx);
+  void encodeAngularAzimuthArc(int32_t arc_q, int ctxL, int signCtx);
 
 
   template<size_t NumPrefixCtx, size_t NumSuffixCtx>
@@ -330,20 +331,34 @@ private:
   int _pgeom_min_radius;
 
   // ---- Angular grid coding contexts (encodePredictiveGeometryAngular) ----
-  AdaptiveBitModel _ctxAngElevGt0;
-  AdaptiveBitModel _ctxAngElevSign;
-  AdaptiveBitModel _ctxAngElevEgl;
-  AdaptiveBitModel _ctxAngColGt0;
-  AdaptiveBitModel _ctxAngColSign;
-  AdaptiveBitModel _ctxAngColEgl;
+  // ctxL = (bestIdx > 0) ? 1 : 0  (TMC3 _ctxResRGTZero[interFlag][ctxL] -> [ctxL])
+  // ctxLR = ctxL + (|dColumn| > qphiThreshold ? 2 : 0)  (TMC3 qphi bucket on resR)
+  // signCtx = (precDColumnNz ? 2 : 0) + precSignR     (4-state sign history)
+  // TMC3-style binarization for dRing / dColumn (mirrors encodePhiMultiplier):
+  //   gt0, gt1, 3-bit context-tree for |v| ∈ [2..9], EGk=0 tail for |v| ≥ 10.
+  AdaptiveBitModel _ctxAngElevGtN[2][2];
+  AdaptiveBitModel _ctxAngElevTree[2][7];
+  AdaptiveBitModel _ctxAngElevEgTail[2];
+  AdaptiveBitModel _ctxAngElevSign[2];
+  AdaptiveBitModel _ctxAngColGtN[2][2];
+  AdaptiveBitModel _ctxAngColTree[2][7];
+  AdaptiveBitModel _ctxAngColEgTail[2];
+  AdaptiveBitModel _ctxAngColSign[2];
   AdaptiveBitModel _ctxAngPredIdx[3];
-  AdaptiveBitModel _ctxAngRadiusGt0;
-  AdaptiveBitModel _ctxAngRadiusGt1;
-  AdaptiveBitModel _ctxAngRadiusSign;
-  AdaptiveBitModel _ctxAngRadiusEgl;
-  AdaptiveBitModel _ctxAngAzimuthGt0;
-  AdaptiveBitModel _ctxAngAzimuthSign;
-  AdaptiveBitModel _ctxAngAzimuthEgl;
+  AdaptiveBitModel _ctxAngRadiusGt0[4];
+  AdaptiveBitModel _ctxAngRadiusGt1[4];
+  AdaptiveBitModel _ctxAngRadiusSign[2][4];
+  AdaptiveBitModel _ctxAngRadiusEgPre[8];
+  AdaptiveBitModel _ctxAngRadiusEgSuf[8];
+  AdaptiveBitModel _ctxAngAzimuthGt0[2];
+  AdaptiveBitModel _ctxAngAzimuthSign[2][4];
+  AdaptiveBitModel _ctxAngAzimuthEgPre[8];
+  AdaptiveBitModel _ctxAngAzimuthEgSuf[8];
+  AdaptiveBitModel _ctxAngArcGt0[2];
+  AdaptiveBitModel _ctxAngArcGt1[2];
+  AdaptiveBitModel _ctxAngArcSign[2][4];
+  AdaptiveBitModel _ctxAngArcEgPre[8];
+  AdaptiveBitModel _ctxAngArcEgSuf[8];
 
   int _maxPredIdx;
   int _maxPredIdxTested;
@@ -1992,21 +2007,47 @@ encodePredictiveGeometry(
 // ============================================================================
 
 void
-PredGeomEncoder::encodeAngularElevStep(int32_t v)
+PredGeomEncoder::encodeAngularElevStep(int32_t v, int ctxL)
 {
-  _aec->encode(v != 0, _ctxAngElevGt0);
+  _aec->encode(v != 0, _ctxAngElevGtN[ctxL][0]);
   if (!v) return;
-  _aec->encodeExpGolomb(std::abs(v) - 1, 0, _ctxAngElevEgl);
-  _aec->encode(v < 0, _ctxAngElevSign);
+  int32_t value = std::abs(v) - 1;
+  _aec->encode(value > 0, _ctxAngElevGtN[ctxL][1]);
+  if (!value) {
+    _aec->encode(v < 0, _ctxAngElevSign[ctxL]);
+    return;
+  }
+  value--;  // value = |v| - 2
+  const int valueMinus7 = value - 7;
+  value = std::min(value, 7);
+  _aec->encode((value >> 2) & 1, _ctxAngElevTree[ctxL][0]);
+  _aec->encode((value >> 1) & 1, _ctxAngElevTree[ctxL][1 + (value >> 2)]);
+  _aec->encode((value >> 0) & 1, _ctxAngElevTree[ctxL][3 + (value >> 1)]);
+  if (valueMinus7 >= 0)
+    _aec->encodeExpGolomb(valueMinus7, 0, _ctxAngElevEgTail[ctxL]);
+  _aec->encode(v < 0, _ctxAngElevSign[ctxL]);
 }
 
 void
-PredGeomEncoder::encodeAngularColStep(int32_t v)
+PredGeomEncoder::encodeAngularColStep(int32_t v, int ctxL)
 {
-  _aec->encode(v != 0, _ctxAngColGt0);
+  _aec->encode(v != 0, _ctxAngColGtN[ctxL][0]);
   if (!v) return;
-  _aec->encodeExpGolomb(std::abs(v) - 1, 0, _ctxAngColEgl);
-  _aec->encode(v < 0, _ctxAngColSign);
+  int32_t value = std::abs(v) - 1;
+  _aec->encode(value > 0, _ctxAngColGtN[ctxL][1]);
+  if (!value) {
+    _aec->encode(v < 0, _ctxAngColSign[ctxL]);
+    return;
+  }
+  value--;
+  const int valueMinus7 = value - 7;
+  value = std::min(value, 7);
+  _aec->encode((value >> 2) & 1, _ctxAngColTree[ctxL][0]);
+  _aec->encode((value >> 1) & 1, _ctxAngColTree[ctxL][1 + (value >> 2)]);
+  _aec->encode((value >> 0) & 1, _ctxAngColTree[ctxL][3 + (value >> 1)]);
+  if (valueMinus7 >= 0)
+    _aec->encodeExpGolomb(valueMinus7, 0, _ctxAngColEgTail[ctxL]);
+  _aec->encode(v < 0, _ctxAngColSign[ctxL]);
 }
 
 void
@@ -2019,24 +2060,40 @@ PredGeomEncoder::encodeAngularPredIdx(int idx)
 }
 
 void
-PredGeomEncoder::encodeAngularRadius(int32_t v)
+PredGeomEncoder::encodeAngularRadius(int32_t v, int ctxLR, int signCtx)
 {
-  _aec->encode(v != 0, _ctxAngRadiusGt0);
+  // ctxLR ∈ {0..3} = ctxL + qphi-bucket; signCtx ∈ {0..3} = sign-history.
+  // EGk=2 for now-lossless dr (TMC3 resR uses k=2).
+  const int ctxL = ctxLR & 1;
+  _aec->encode(v != 0, _ctxAngRadiusGt0[ctxLR]);
   if (!v) return;
   int32_t absVal = std::abs(v);
-  _aec->encode(--absVal > 0, _ctxAngRadiusGt1);
+  _aec->encode(--absVal > 0, _ctxAngRadiusGt1[ctxLR]);
   if (absVal)
-    _aec->encodeExpGolomb(absVal - 1, 0, _ctxAngRadiusEgl);
-  _aec->encode(v < 0, _ctxAngRadiusSign);
+    _aec->encodeExpGolomb(absVal - 1, 2, _ctxAngRadiusEgPre, _ctxAngRadiusEgSuf);
+  _aec->encode(v < 0, _ctxAngRadiusSign[ctxL][signCtx]);
 }
 
 void
-PredGeomEncoder::encodeAngularAzimuth(int32_t v)
+PredGeomEncoder::encodeAngularAzimuth(int32_t v, int ctxL, int signCtx)
 {
-  _aec->encode(v != 0, _ctxAngAzimuthGt0);
+  _aec->encode(v != 0, _ctxAngAzimuthGt0[ctxL]);
   if (!v) return;
-  _aec->encodeExpGolomb(std::abs(v) - 1, 0, _ctxAngAzimuthEgl);
-  _aec->encode(v < 0, _ctxAngAzimuthSign);
+  _aec->encodeExpGolomb(
+    std::abs(v) - 1, 0, _ctxAngAzimuthEgPre, _ctxAngAzimuthEgSuf);
+  _aec->encode(v < 0, _ctxAngAzimuthSign[ctxL][signCtx]);
+}
+
+void
+PredGeomEncoder::encodeAngularAzimuthArc(int32_t arc_q, int ctxL, int signCtx)
+{
+  _aec->encode(arc_q != 0, _ctxAngArcGt0[ctxL]);
+  if (!arc_q) return;
+  int absVal = std::abs(arc_q);
+  _aec->encode(--absVal > 0, _ctxAngArcGt1[ctxL]);
+  if (absVal)
+    _aec->encodeExpGolomb(absVal - 1, 1, _ctxAngArcEgPre, _ctxAngArcEgSuf);
+  _aec->encode(arc_q < 0, _ctxAngArcSign[ctxL][signCtx]);
 }
 
 // ============================================================================
@@ -2048,12 +2105,18 @@ encodePredictiveGeometryAngular(
   PCCPointSet3& cloud,
   PredGeomContexts& ctxtMem,
   EntropyEncoder* arithmeticEncoder,
-  double qpInt)
+  int arcQuantLog2,
+  bool lossless,
+  fp::AngularMetrics* metrics)
 {
   auto numPoints = cloud.getPointCount();
   const int32_t log2ScaleRadius = gps.geom_angular_radius_inv_scale_log2;
-  const int32_t scalePhi = 1 << (gps.geom_angular_azimuth_scale_log2_minus11 + 12);
-  const int32_t maxPtsPerRot = 1090;  // Velodyne HDL-32E horizontal resolution
+  const int32_t azimuthTwoPiLog2 = gps.geom_angular_azimuth_scale_log2_minus11 + 12;
+  const int32_t scalePhi = 1 << azimuthTwoPiLog2;
+  const int32_t azimuthSpeed = std::max(
+    1, gps.geom_angular_azimuth_speed_minus1 + 1);
+  const int32_t maxPtsPerRot =
+    fp::deriveAngularMaxPtsPerRot(scalePhi, azimuthSpeed);
 
   PCCPointSet3 outCloud;
   outCloud.addRemoveAttributes(cloud.hasColors(), cloud.hasReflectances());
@@ -2068,11 +2131,14 @@ encodePredictiveGeometryAngular(
   SphericalToCartesian sphToCart(gps);
   const Vec3<int32_t> origin = gbh.geomAngularOrigin(gps);
 
-  // Per-ring state: last 4 r values, last azimuth shift, last column index
-  std::array<std::array<int32_t, 4>, fp::kNumRings> radiusList = {};
-  std::array<int32_t, fp::kNumRings> azimuthList = {};
-  std::array<int32_t, fp::kNumRings> prevColumn = {};
-  int prevRing = 0;
+  fp::AngularGridState gridState;
+  int prevRing = -1;  // for ring-transition metric (-1 = no prior point)
+  // TMC3-style sign-history state, mirrored bit-exactly in the decoder.
+  int precSignR = 0;        // last (qDr < 0)
+  int precSignArc = 0;      // last (qAz < 0)
+  int precDColumnNz = 0;    // last (dColumn != 0) -> proxy for "azimuth step delta"
+  int precDAzNz = 0;        // last (qAz != 0)     -> proxy for arc activity
+  const int qphiThreshold = gps.resR_context_qphi_threshold;
 
   for (int p = 0; p < numPoints; p++) {
     const auto& xyz = cloud[p];
@@ -2084,81 +2150,94 @@ encodePredictiveGeometryAngular(
     int32_t phi = int32_t(std::round(
       std::atan2(double(xyz[1]), double(xyz[0])) / (2.0 * M_PI) * scalePhi));
 
-    // Column assignment: map phi to scan-position index [0, maxPtsPerRot)
-    int32_t phiShifted = phi + scalePhi / 2;  // shift [-S/2, S/2) → [0, S)
-    int32_t column = int32_t((int64_t)phiShifted * maxPtsPerRot / scalePhi);
-    column = std::max(0, std::min(maxPtsPerRot - 1, column));
-    int32_t azimuthShift = phiShifted
-      - int32_t((int64_t)column * scalePhi / maxPtsPerRot);
+    const auto curr = fp::makeAngularGridPoint(
+      thetaIdx, phi, sphR, scalePhi, azimuthSpeed, maxPtsPerRot);
+    const auto preds = fp::makeAngularPredictors(gridState);
 
-    // Occupancy map: ring step + azimuth column step
-    int32_t dRing   = thetaIdx - prevRing;
-    int32_t dColumn = column - prevColumn[thetaIdx];
-    enc.encodeAngularElevStep(dRing);
-    enc.encodeAngularColStep(dColumn);
-
-    // 4 prediction candidates for sphR
-    const auto& rl = radiusList[thetaIdx];
-    int32_t cand0 = rl[0];
-    int32_t cand1 = rl[3];
-    int32_t cand2 = (rl[0] + rl[1]) / 2;
-    int32_t cand3 = (thetaIdx > 0)
-      ? radiusList[thetaIdx - 1][0]
-      : (thetaIdx + 1 < fp::kNumRings ? radiusList[thetaIdx + 1][0] : rl[0]);
-    int32_t cands[4] = {cand0, cand1, cand2, cand3};
-
+    // Simple predictor selection: argmin |dr| over valid candidates.
     int bestIdx = 0;
-    int32_t bestErr = std::abs(sphR - cands[0]);
-    for (int i = 1; i < 4; i++) {
-      int32_t err = std::abs(sphR - cands[i]);
-      if (err < bestErr) { bestErr = err; bestIdx = i; }
+    int32_t bestAbsDr = std::numeric_limits<int32_t>::max();
+    for (int i = 0; i < fp::kAngularPredCandidates; i++) {
+      if (!preds[i].valid) continue;
+      const int32_t absDr = std::abs(curr.sphR - preds[i].sphR);
+      if (absDr < bestAbsDr) { bestAbsDr = absDr; bestIdx = i; }
     }
 
-    int32_t dr  = sphR - cands[bestIdx];
-    int32_t dAz = azimuthShift - azimuthList[thetaIdx];
+    const auto& pred = preds[bestIdx];
+    const int32_t dRing   = curr.ring - pred.ring;
+    const int32_t dColumn =
+      fp::signedModDelta(curr.column, pred.column, maxPtsPerRot);
+    const int32_t dr      = curr.sphR - pred.sphR;
+    // Azimuth-shift is periodic in scalePhi; keep the shortest wrapped delta.
+    const int32_t dAz = fp::signedModDelta(
+      curr.azimuthShift, pred.azimuthShift, scalePhi);
 
-    // Quantization
-    // QP_int = qpInt mm (= 2^flat_qp; sphR unit = mm when log2ScaleRadius=0)
-    // QS_r adjusted for scan azimuth direction; QS_az converts mm step → phi units
-    const double phi_rad =
-      double(column) * (2.0 * M_PI) / double(maxPtsPerRot);
-    const double cos_sin =
-      std::abs(std::cos(phi_rad)) + std::abs(std::sin(phi_rad));
-    const double QS_r = qpInt / std::max(cos_sin, 1e-6);
-
-    int32_t quantized_dr, recon_dr;
-    if (QS_r >= 0.5) {
-      quantized_dr = int32_t(std::round(double(dr) / QS_r));
-      recon_dr     = int32_t(std::round(double(quantized_dr) * QS_r));
+    int32_t qDr, reconDr, qAz, reconDAz, reconR;
+    if (lossless) {
+      qDr = dr;  reconDr = dr;
+      qAz = dAz; reconDAz = dAz;
+      reconR = pred.sphR + dr;
     } else {
-      quantized_dr = dr;
-      recon_dr     = dr;
-    }
-    const int32_t reconR = cands[bestIdx] + recon_dr;
+      // TMC3-style primary radius handling: no explicit dr quantization step.
+      qDr = dr;
+      reconDr = dr;
+      reconR = std::max<int32_t>(0, pred.sphR + reconDr);
 
-    const double QS_az = (reconR > 0)
-      ? QS_r * double(scalePhi) / (2.0 * M_PI * double(reconR))
-      : 0.0;
+      const int32_t rScaled = reconR << 3;
+      int32_t arc = fp::angularPhiToArcResidual(dAz, rScaled, azimuthTwoPiLog2);
+      const int32_t phiBound =
+        fp::angularPhiBound(azimuthSpeed, rScaled, azimuthTwoPiLog2);
+      arc = std::max(-phiBound, std::min(phiBound, arc));
 
-    int32_t quantized_dAz, recon_dAz;
-    if (QS_az >= 0.5) {
-      quantized_dAz = int32_t(std::round(double(dAz) / QS_az));
-      recon_dAz     = int32_t(std::round(double(quantized_dAz) * QS_az));
-    } else {
-      quantized_dAz = dAz;
-      recon_dAz     = dAz;
+      qAz = fp::roundDivPow2Signed(arc, arcQuantLog2);
+      const int32_t phiBoundQ = phiBound
+        ? std::max<int32_t>(1, fp::roundDivPow2Signed(phiBound, arcQuantLog2))
+        : 0;
+      qAz = std::max(-phiBoundQ, std::min(phiBoundQ, qAz));
+      reconDAz = fp::angularArcToPhiResidual(
+        qAz << arcQuantLog2, rScaled, azimuthTwoPiLog2);
     }
+
+    const int ctxL = (bestIdx > 0) ? 1 : 0;
+    const int qphiBucket = std::abs(dColumn) > qphiThreshold ? 2 : 0;
+    const int ctxLR = ctxL + qphiBucket;
+    const int signCtxR = (precDColumnNz ? 2 : 0) + precSignR;
+    const int signCtxAz = (precDAzNz ? 2 : 0)
+      + (lossless ? precSignArc : precSignArc);
 
     enc.encodeAngularPredIdx(bestIdx);
-    enc.encodeAngularRadius(quantized_dr);
-    enc.encodeAngularAzimuth(quantized_dAz);
+    enc.encodeAngularElevStep(dRing, ctxL);
+    enc.encodeAngularColStep(dColumn, ctxL);
+    enc.encodeAngularRadius(qDr, ctxLR, signCtxR);
+    if (lossless) enc.encodeAngularAzimuth(qAz, ctxL, signCtxAz);
+    else          enc.encodeAngularAzimuthArc(qAz, ctxL, signCtxAz);
 
-    // Reconstruct from dequantized values (identical formula used in decoder)
-    int32_t reconAz  = azimuthList[thetaIdx] + recon_dAz;
-    int32_t reconCol = prevColumn[thetaIdx] + dColumn;
-    int32_t reconPhi = int32_t((int64_t)reconCol * scalePhi / maxPtsPerRot)
-                     + reconAz - scalePhi / 2;
-    outCloud[p] = origin + sphToCart({reconR, reconPhi, thetaIdx});
+    // Update sign-history state (mirrored in decoder).
+    precSignR = (qDr < 0) ? 1 : 0;
+    precSignArc = (qAz < 0) ? 1 : 0;
+    precDColumnNz = (dColumn != 0) ? 1 : 0;
+    precDAzNz = (qAz != 0) ? 1 : 0;
+
+    if (metrics) {
+      metrics->predIdxHist[bestIdx]++;
+      if (pred.ring == curr.ring) metrics->sameRingHit++;
+      if (prevRing >= 0 && prevRing != curr.ring) metrics->ringTransitions++;
+    }
+    prevRing = curr.ring;
+
+    // Reconstruct grid point (wrap column, canonicalize azimuthShift)
+    fp::AngularGridPoint recon{
+      curr.ring,
+      fp::wrapColumn(int64_t(pred.column) + dColumn, maxPtsPerRot),
+      reconR,
+      pred.azimuthShift + reconDAz,
+      true};
+    recon = fp::canonicalizeAngularGridPoint(
+      recon, scalePhi, azimuthSpeed, maxPtsPerRot);
+
+    const int32_t reconPhi =
+      fp::reconstructAngularPhi(recon, scalePhi, azimuthSpeed);
+    outCloud[p] = origin + sphToCart({recon.sphR, reconPhi, recon.ring});
 
     if (cloud.hasLaserAngles())
       outCloud.setLaserAngle(p, cloud.getLaserAngle(p));
@@ -2167,12 +2246,7 @@ encodePredictiveGeometryAngular(
     if (cloud.hasReflectances())
       outCloud.setReflectance(p, cloud.getReflectance(p));
 
-    // Update state (dequantized values)
-    for (int i = 3; i > 0; i--) radiusList[thetaIdx][i] = radiusList[thetaIdx][i - 1];
-    radiusList[thetaIdx][0] = reconR;
-    azimuthList[thetaIdx]   = reconAz;
-    prevColumn[thetaIdx]    = reconCol;
-    prevRing = thetaIdx;
+    gridState.push(recon);
   }
 
   enc.encodeEndOfTreesFlag(true);
